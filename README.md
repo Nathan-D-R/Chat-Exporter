@@ -1,111 +1,99 @@
-# copilot-exporter
+# Chat Exporter
 
-Export GitHub Copilot chat sessions from VS Code to structured Markdown files,
-organized by workspace.
+Export local AI coding chat sessions to structured Markdown files, organized by
+provider and workspace.
+
+The Python distribution and command are named `chat-exporter`.
+
+## Supported providers
+
+| Provider | Local store |
+|---|---|
+| GitHub Copilot | VS Code `User/workspaceStorage/*/chatSessions` |
+| AGY / Antigravity CLI | `~/.gemini/antigravity-cli` |
+| Claude Code | `~/.claude/projects` |
+| Codex | `$CODEX_HOME/sessions` or `~/.codex/sessions` |
+| OpenCode | `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode` |
+
+AGY is decoded directly from its read-only SQLite/protobuf store. OpenCode
+support handles both its legacy JSON layout and current `opencode*.db` store. Provider formats are not
+stable public interchange formats, so test an export after upgrading a client.
 
 ## Installation
 
-### With uv (recommended)
-
-Install uv if you don't have it:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Then install the tool globally:
+With [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv tool install .
 ```
 
-Or run directly without installing (uv manages the virtualenv automatically):
+Or run without installing:
 
 ```bash
-uv run copilot-exporter [OPTIONS]
+uv run chat-exporter [OPTIONS]
 ```
 
-### With plain Python
+Plain Python 3.11 or newer also works:
 
 ```bash
-git clone https://github.com/Nathan-D-R/Copilot-Exporter
-cd copilot-exporter
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -e .
-copilot-exporter [OPTIONS]
 ```
 
 ## Usage
 
-```
-copilot-exporter [OPTIONS]
+```text
+chat-exporter [OPTIONS]
 
 Options:
-  -o, --output-dir PATH    Directory to write Markdown files (default: ./export)
-  -w, --workspace NAME     Only export sessions from workspaces whose name
-                           contains NAME (case-insensitive, repeatable)
-  --session-id ID          Export only the session with this exact ID
-  --no-tools               Omit tool call details from output
-  --include-thinking       Include model thinking/reasoning blocks
-  --min-messages N         Skip sessions with fewer than N user messages
-                           (default: 1)
-  --list                   List discovered workspaces and sessions, then exit
-  --config-root PATH       Override the VS Code User config directory
+  -o, --output-dir PATH    Output directory (default: ./export)
+  --provider NAME          Export one provider; repeatable (default: all)
+  -w, --workspace NAME     Filter workspace name; repeatable
+  --session-id ID          Export one exact session ID
+  --no-tools               Omit tool calls and results
+  --include-thinking       Include stored reasoning blocks
+  --min-messages N         Minimum user messages (default: 1)
+  --list                   List discovered sessions without exporting
+  --config-root PATH       Override VS Code User config root for Copilot
 ```
+
+Provider names are `copilot`, `agy`, `claude`, `codex`, and `opencode`.
 
 ## Examples
 
 ```bash
-# List all workspaces and sessions
-copilot-exporter --list
+# List every locally discoverable session
+chat-exporter --list
 
-# Export everything to ./export/
-copilot-exporter
+# Export Claude Code and Codex only
+chat-exporter --provider claude --provider codex
 
-# Export only sessions from a specific workspace
-copilot-exporter -w MyProject -o ~/Documents/copilot-export
-
-# Export sessions with at least 5 messages, without tool call details
-copilot-exporter --min-messages 5 --no-tools
-
-# Export a single session by ID
-copilot-exporter --session-id 93f92856-c448-4328-ab10-a13c3a059e1e
+# Export one workspace without tool output
+chat-exporter -w MyProject --no-tools -o ~/Documents/chat-export
 ```
 
-## Output structure
+## Output
 
-```
+```text
 export/
-  WorkspaceName/
-    Session Title.md
-    Another Session.md
-  OtherProject/
-    ...
+  claude/
+    MyProject/
+      Session title.md
+  codex/
+    MyProject/
+      Another session.md
 ```
 
-Each Markdown file contains:
+Each Markdown file includes provider, workspace, session ID, creation date,
+model when available, user and assistant turns, optional tool details, and
+optional stored thinking blocks.
 
-- Session metadata (ID, creation date, model)
-- Each turn as a User/Assistant pair with timestamps
-- Tool invocations as collapsed `<details>` blocks (unless `--no-tools`)
-- Thinking blocks optionally included with `--include-thinking`
+The exporter opens source stores read-only. It writes only beneath the selected
+output directory.
 
-## Supported editors
+## Copilot editor support
 
-- VS Code
-- VS Code Insiders
-- Cursor
-- VSCodium
-
-## Cross-platform support
-
-Config directories are detected automatically:
-
-| OS      | Path                                                       |
-|---------|------------------------------------------------------------|
-| Linux   | `~/.config/Code/User/workspaceStorage`                     |
-| macOS   | `~/Library/Application Support/Code/User/workspaceStorage` |
-| Windows | `%APPDATA%\Code\User\workspaceStorage`                     |
-
-Use `--config-root` to override for non-standard installation paths.
+Copilot workspace discovery supports VS Code, VS Code Insiders, Cursor, and
+VSCodium on Linux, macOS, and Windows. Use `--config-root` for a non-standard
+VS Code installation.

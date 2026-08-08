@@ -108,6 +108,8 @@ def render_session(
     lines.append(f"# {session.title}")
     lines.append("")
     lines.append(f"**Session ID:** `{session.session_id}`  ")
+    lines.append(f"**Provider:** `{session.provider}`  ")
+    lines.append(f"**Workspace:** `{session.workspace}`  ")
     lines.append(f"**Created:** {_fmt_ts(session)}  ")
     if session.model_id:
         lines.append(f"**Model:** `{session.model_id}`  ")

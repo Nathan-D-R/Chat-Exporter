@@ -65,6 +65,9 @@ class ChatSession:
     created_ms: int
     model_id: str
     requests: list[ChatRequest] = field(default_factory=list)
+    provider: str = "copilot"
+    workspace: str = "Unknown"
+    source_path: str = ""
 
     @property
     def created_at(self) -> datetime:

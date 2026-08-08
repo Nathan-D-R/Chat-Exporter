@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.11"
 
 [[package]]
-name = "copilot-exporter"
-version = "0.1.0"
+name = "chat-exporter"
+version = "0.2.0"
 source = { editable = "." }
