@@ -104,14 +104,16 @@ export/
 
 Each Markdown file opens with a session header: provider, workspace, session
 ID, creation date, turn count, wall-clock span, every model used with a
-per-model turn count, and a tool-call histogram. For Copilot it also reports
-total generation time, completion tokens, and the Copilot Chat version.
+per-model turn count, a tool-call histogram, total generation time, token
+totals, the git branch, and the client version.
 
 Every turn is a User/Assistant pair whose assistant line carries its own
 attribution: the model that answered that turn, how long it took, time to
-first token, and completion tokens. Models are recorded per request, so a
-session where you switched models mid-conversation reports each turn
-accurately instead of assuming one model throughout.
+first token, and its token counts - output, and where the provider records
+them, input, cached, and reasoning tokens. Models are recorded per request, so
+a session where you switched models mid-conversation reports each turn
+accurately instead of assuming one model throughout. A turn that ended for an
+unusual reason, such as hitting a length limit, says so.
 
 Tool invocations render as collapsed `<details>` blocks unless `--no-tools`,
 carrying the command, working directory, exit code and duration for terminal
@@ -125,10 +127,13 @@ short answer. Files changed are summarized per turn and per session unless
 `--no-file-edits`; `--include-context` additionally lists the files attached
 to each turn.
 
-Depth varies by provider, since each stores a different amount. Copilot
-transcripts carry the richest record: timing, token counts, tool output and
-exit codes. Other providers populate what their formats preserve, and the
-remaining fields are simply omitted.
+Depth varies by provider, since each stores a different amount. Copilot,
+Claude Code, Codex, and OpenCode all record tool output, per-turn timing, and
+token usage; shell exit codes come from Copilot, Codex, and OpenCode, and
+Claude Code contributes its subagent transcripts, joined back onto the call
+that launched them. AGY stores the least, since its transcripts are decoded
+from an undocumented protobuf. Fields a format does not preserve are simply
+omitted.
 
 `--format json` writes the complete parsed record for feeding into other
 tooling: every field above, plus tool call IDs, canonical tool names,

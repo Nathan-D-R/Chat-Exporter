@@ -35,6 +35,20 @@ _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
 _MD_ESCAPE_RE = re.compile(r"\\([_*`\[\]#])")
 
+# Stop reasons that mean the turn ended the way it was meant to; anything else
+# is worth showing next to the turn. Spellings vary by provider.
+_NORMAL_STOPS = {
+    "end_turn", "tool_use", "stop_sequence", "pause_turn", "stop", "tool-calls", "tool_calls",
+}
+
+# What the agent_version on a session is the version of.
+_CLIENT_LABELS = {
+    "copilot": "Copilot Chat",
+    "claude": "Claude Code",
+    "codex": "Codex CLI",
+    "opencode": "opencode",
+}
+
 _STATUS_MARKS = {
     "completed": "x",
     "in-progress": "~",
@@ -91,6 +105,26 @@ def _collapse_blank_lines(text: str) -> str:
     return "\n".join(out)
 
 
+def _balance_fences(text: str) -> str:
+    """Close a code fence the text leaves open.
+
+    Thinking blocks go into <details> as raw markdown so their own formatting
+    survives; a stray opening fence would otherwise swallow the closing tag
+    and every turn after it.
+    """
+    marker = ""
+    for line in text.split("\n"):
+        match = _FENCE_RE.match(line)
+        if not match:
+            continue
+        token = match.group(1)
+        if not marker:
+            marker = token
+        elif token[0] == marker[0] and len(token) >= len(marker):
+            marker = ""
+    return f"{text}\n{marker}" if marker else text
+
+
 def _short_path(path: str) -> str:
     """Shorten an absolute path against the user's home directory."""
     try:
@@ -112,6 +146,22 @@ def _fmt_duration(ms: int | None) -> str:
         return f"{minutes}m {seconds:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes:02d}m"
+
+
+def _fmt_tokens(req: ChatRequest) -> str:
+    """One token figure per turn, or a breakdown when the provider records more
+    than the completion count."""
+    if not req.completion_tokens and not req.input_tokens:
+        return ""
+    context = [
+        (req.input_tokens, "in"),
+        (req.cache_read_tokens, "cached"),
+        (req.reasoning_tokens, "reasoning"),
+    ]
+    shown = [f"{count:,} {label}" for count, label in context if count]
+    if not shown:
+        return f"{req.completion_tokens:,} tokens"
+    return " / ".join([f"{req.completion_tokens or 0:,} out", *shown]) + " tokens"
 
 
 def _fmt_ts(session: ChatSession) -> str:
@@ -244,8 +294,11 @@ def _assistant_meta(req: ChatRequest, include_metrics: bool) -> str:
     first = _fmt_duration(req.first_progress_ms)
     if first:
         bits.append(f"first token {first}")
-    if req.completion_tokens:
-        bits.append(f"{req.completion_tokens:,} tokens")
+    tokens = _fmt_tokens(req)
+    if tokens:
+        bits.append(tokens)
+    if req.stop_reason and req.stop_reason not in _NORMAL_STOPS:
+        bits.append(f"stopped: {req.stop_reason}")
     if req.permission_level and req.permission_level != "default":
         bits.append(req.permission_level)
     return _join_meta(bits)
@@ -266,7 +319,7 @@ def _render_response(
         elif part.kind == "thinking" and include_thinking and part.text.strip():
             sections.append(
                 "<details><summary>Thinking</summary>\n\n"
-                + part.text.strip()
+                + _balance_fences(part.text.strip())
                 + "\n\n</details>"
             )
         elif part.kind == "tool_call" and include_tools and part.tool:
@@ -374,7 +427,14 @@ def _render_header(session: ChatSession, include_metrics: bool) -> list[str]:
             lines.append(f"**Time generating:** {active}  ")
         tokens = session.total_completion_tokens
         if tokens:
-            lines.append(f"**Completion tokens:** {tokens:,}  ")
+            context = [
+                (session.total_input_tokens, "input"),
+                (session.total_cache_read_tokens, "cached"),
+            ]
+            extra = ", ".join(f"{count:,} {label}" for count, label in context if count)
+            lines.append(
+                f"**Completion tokens:** {tokens:,}" + (f"  ({extra})" if extra else "") + "  "
+            )
 
         tools = session.tool_counts
         if tools:
@@ -386,8 +446,12 @@ def _render_header(session: ChatSession, include_metrics: bool) -> list[str]:
                 + "  "
             )
 
+    if session.git_branch:
+        lines.append(f"**Branch:** `{session.git_branch}`  ")
+
     if session.agent_version:
-        lines.append(f"**Copilot Chat:** `{session.agent_version}`  ")
+        label = _CLIENT_LABELS.get(session.provider, "Client")
+        lines.append(f"**{label}:** `{session.agent_version}`  ")
 
     lines.append("")
     return lines
@@ -455,6 +519,8 @@ def render_session_json(
     data["span_ms"] = session.span_ms
     data["total_elapsed_ms"] = session.total_elapsed_ms
     data["total_completion_tokens"] = session.total_completion_tokens
+    data["total_input_tokens"] = session.total_input_tokens
+    data["total_cache_read_tokens"] = session.total_cache_read_tokens
     data["total_tool_calls"] = session.total_tool_calls
     data["models_used"] = dict(session.models_used)
     data["tool_counts"] = dict(session.tool_counts)
