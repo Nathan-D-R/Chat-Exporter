@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .discovery import find_workspace_storage_dirs, get_workspace_name, list_chat_session_files
-from .parser import ChatRequest, ChatSession, ResponsePart, parse_session
+from .parser import ChatRequest, ChatSession, ResponsePart, ToolCall, parse_session
 
 PROVIDERS = ("copilot", "agy", "claude", "codex", "opencode")
 
@@ -106,8 +106,11 @@ def parse_claude(path: Path) -> ChatSession | None:
                         current.response_parts.append(ResponsePart("thinking", text=part.get("thinking", "")))
                     elif kind == "tool_use":
                         current.response_parts.append(ResponsePart(
-                            "tool_call", tool_name=part.get("name", ""),
-                            tool_message=json.dumps(part.get("input", {}), ensure_ascii=False, indent=2),
+                            "tool_call",
+                            tool=ToolCall(
+                                name=part.get("name", ""),
+                                arguments=json.dumps(part.get("input", {}), ensure_ascii=False, indent=2),
+                            ),
                         ))
     if not requests:
         return None
@@ -155,14 +158,16 @@ def parse_codex(path: Path) -> ChatSession | None:
             elif role == "assistant" and current and text:
                 current.response_parts.append(ResponsePart("text", text=text))
         elif kind in ("function_call", "custom_tool_call") and current:
-            part = ResponsePart("tool_call", tool_name=payload.get("name", ""),
-                                tool_message=str(payload.get("arguments") or payload.get("input") or ""))
+            part = ResponsePart("tool_call", tool=ToolCall(
+                name=payload.get("name", ""),
+                arguments=str(payload.get("arguments") or payload.get("input") or ""),
+            ))
             current.response_parts.append(part)
             tool_calls[payload.get("call_id", "")] = part
         elif kind in ("function_call_output", "custom_tool_call_output"):
             part = tool_calls.get(payload.get("call_id", ""))
-            if part:
-                part.text = _text(payload.get("output"))
+            if part and part.tool:
+                part.tool.output = _text(payload.get("output"))
         elif kind == "reasoning" and current:
             thinking = _text(payload.get("summary"))
             if thinking:
@@ -299,9 +304,11 @@ def _opencode_message(info: dict[str, Any], parts: list[dict[str, Any]], current
                 current.response_parts.append(ResponsePart("thinking", text=part["text"]))
             elif kind == "tool":
                 state = part.get("state") or {}
-                current.response_parts.append(ResponsePart("tool_call", tool_name=part.get("tool", ""),
-                    tool_message=json.dumps(state.get("input", {}), ensure_ascii=False, indent=2),
-                    text=_text(state.get("output"))))
+                current.response_parts.append(ResponsePart("tool_call", tool=ToolCall(
+                    name=part.get("tool", ""),
+                    arguments=json.dumps(state.get("input", {}), ensure_ascii=False, indent=2),
+                    output=_text(state.get("output")),
+                )))
     return current
 
 

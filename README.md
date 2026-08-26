@@ -51,8 +51,16 @@ Options:
   --provider NAME          Export one provider; repeatable (default: all)
   -w, --workspace NAME     Filter workspace name; repeatable
   --session-id ID          Export one exact session ID
+  --format {md,json}       Output format (default: md); json emits the full
+                           structured record
   --no-tools               Omit tool calls and results
+  --max-tool-output N      Truncate each tool output to N characters
+                           (default: 2000; 0 = unlimited)
+  --tool-args              Include the JSON arguments each tool was called with
   --include-thinking       Include stored reasoning blocks
+  --no-metrics             Omit per-turn model attribution, timing and tokens
+  --no-file-edits          Omit the files-changed summaries
+  --include-context        List the context files attached to each turn
   --min-messages N         Minimum user messages (default: 1)
   --list                   List discovered sessions without exporting
   --config-root PATH       Override VS Code User config root for Copilot
@@ -71,6 +79,15 @@ chat-exporter --provider claude --provider codex
 
 # Export one workspace without tool output
 chat-exporter -w MyProject --no-tools -o ~/Documents/chat-export
+
+# Full detail: reasoning, tool arguments, untruncated output
+chat-exporter --include-thinking --tool-args --max-tool-output 0
+
+# Structured JSON for further processing
+chat-exporter --format json -o ~/chat-json
+
+# Reading copy: prose only, no tool noise or metrics
+chat-exporter --no-tools --no-metrics --no-file-edits
 ```
 
 ## Output
@@ -85,9 +102,37 @@ export/
       Another session.md
 ```
 
-Each Markdown file includes provider, workspace, session ID, creation date,
-model when available, user and assistant turns, optional tool details, and
-optional stored thinking blocks.
+Each Markdown file opens with a session header: provider, workspace, session
+ID, creation date, turn count, wall-clock span, every model used with a
+per-model turn count, and a tool-call histogram. For Copilot it also reports
+total generation time, completion tokens, and the Copilot Chat version.
+
+Every turn is a User/Assistant pair whose assistant line carries its own
+attribution: the model that answered that turn, how long it took, time to
+first token, and completion tokens. Models are recorded per request, so a
+session where you switched models mid-conversation reports each turn
+accurately instead of assuming one model throughout.
+
+Tool invocations render as collapsed `<details>` blocks unless `--no-tools`,
+carrying the command, working directory, exit code and duration for terminal
+calls, captured output truncated at `--max-tool-output`, and argument JSON
+with `--tool-args`. Todo lists render as checklists, and subagent calls show
+their own model, prompt and result.
+
+Turn outcomes such as cancellations, rate limits, network errors, and
+length-limit truncations are called out rather than silently producing a
+short answer. Files changed are summarized per turn and per session unless
+`--no-file-edits`; `--include-context` additionally lists the files attached
+to each turn.
+
+Depth varies by provider, since each stores a different amount. Copilot
+transcripts carry the richest record: timing, token counts, tool output and
+exit codes. Other providers populate what their formats preserve, and the
+remaining fields are simply omitted.
+
+`--format json` writes the complete parsed record for feeding into other
+tooling: every field above, plus tool call IDs, canonical tool names,
+per-call error flags, and raw timing values.
 
 The exporter opens source stores read-only. It writes only beneath the selected
 output directory.
