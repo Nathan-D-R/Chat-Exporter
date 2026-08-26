@@ -61,6 +61,15 @@ def _uri_path(value: Any) -> str:
     return d.get("fsPath") or d.get("path") or ""
 
 
+def _epoch_ms(value: int) -> datetime:
+    """Milliseconds to a UTC datetime, falling back to the epoch for values the
+    platform cannot represent."""
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+
+
 def _dedupe(paths: list[str]) -> list[str]:
     seen: dict[str, None] = {}
     for p in paths:
@@ -142,6 +151,10 @@ class ChatRequest:
     response_parts: list[ResponsePart] = field(default_factory=list)
     # metrics
     completion_tokens: int | None = None
+    input_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    reasoning_tokens: int | None = None
     elapsed_ms: int | None = None
     total_elapsed_ms: int | None = None
     first_progress_ms: int | None = None
@@ -149,6 +162,7 @@ class ChatRequest:
     error_code: str = ""
     error_message: str = ""
     is_incomplete: bool = False
+    stop_reason: str = ""
     # context
     mode_name: str = ""
     permission_level: str = ""
@@ -158,9 +172,7 @@ class ChatRequest:
 
     @property
     def timestamp(self) -> datetime:
-        if self.timestamp_ms:
-            return datetime.fromtimestamp(self.timestamp_ms / 1000, tz=timezone.utc)
-        return datetime.fromtimestamp(0, tz=timezone.utc)
+        return _epoch_ms(self.timestamp_ms)
 
     @property
     def duration_ms(self) -> int | None:
@@ -199,12 +211,12 @@ class ChatSession:
     source_path: str = ""
     responder: str = ""
     agent_version: str = ""
+    cwd: str = ""
+    git_branch: str = ""
 
     @property
     def created_at(self) -> datetime:
-        if self.created_ms:
-            return datetime.fromtimestamp(self.created_ms / 1000, tz=timezone.utc)
-        return datetime.fromtimestamp(0, tz=timezone.utc)
+        return _epoch_ms(self.created_ms)
 
     @property
     def user_requests(self) -> list[ChatRequest]:
@@ -230,6 +242,14 @@ class ChatSession:
     @property
     def total_completion_tokens(self) -> int:
         return sum(r.completion_tokens or 0 for r in self.requests)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(r.input_tokens or 0 for r in self.requests)
+
+    @property
+    def total_cache_read_tokens(self) -> int:
+        return sum(r.cache_read_tokens or 0 for r in self.requests)
 
     @property
     def total_elapsed_ms(self) -> int:
