@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 
 from chat_exporter.parser import parse_session
-from chat_exporter.providers import discover_opencode, parse_agy, parse_claude, parse_codex
+from chat_exporter.providers import (
+    discover_copilot_cli,
+    discover_opencode,
+    parse_agy,
+    parse_claude,
+    parse_codex,
+)
 
 
 def _field(number: int, value: bytes) -> bytes:
@@ -305,6 +311,96 @@ class ProviderTests(unittest.TestCase):
             tool = session.requests[0].tool_calls[0]
             self.assertEqual(tool.name, "file_search")
             self.assertEqual(tool.output, "736 total results\n/work/demo/a.py")
+
+    def _copilot_cli_store(self, tmp, events, usage_rows=()):
+        """Build a ~/.copilot store: an event log plus the sqlite usage index."""
+        root = Path(tmp)
+        state = root / "session-state" / "sess-1"
+        state.mkdir(parents=True)
+        (state / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+        # A sibling directory holding only rewind snapshots must be skipped.
+        (root / "session-state" / "sess-empty" / "rewind-file-snapshots").mkdir(parents=True)
+        db = sqlite3.connect(root / "session-store.db")
+        db.execute(
+            "CREATE TABLE assistant_usage_events (id INTEGER PRIMARY KEY, session_id TEXT,"
+            " turn_index INTEGER, model TEXT, input_tokens INT, output_tokens INT,"
+            " cache_read_tokens INT, cache_write_tokens INT, reasoning_tokens INT,"
+            " duration_ms REAL, time_to_first_token_ms REAL, finish_reason TEXT)"
+        )
+        db.executemany(
+            "INSERT INTO assistant_usage_events (session_id, turn_index, model, input_tokens,"
+            " output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,"
+            " duration_ms, time_to_first_token_ms, finish_reason)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)", usage_rows)
+        db.commit()
+        db.close()
+        return list(discover_copilot_cli(root))
+
+    def test_copilot_cli_events_and_usage(self):
+        events = [
+            {"type": "session.start", "timestamp": "2026-08-27T01:44:55.640Z", "data": {
+                "sessionId": "sess-1", "copilotVersion": "1.0.80",
+                "startTime": "2026-08-27T01:44:55.640Z", "context": {"cwd": "/work/demo"}}},
+            {"type": "session.model_change", "data": {"newModel": "auto"}},
+            {"type": "session.auto_mode_resolved", "data": {"chosenModel": "gpt-5.6-luna"}},
+            {"type": "user.message", "timestamp": "2026-08-27T01:45:00Z",
+             "data": {"content": "list it", "interactionId": "i1"}},
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "c1", "toolName": "bash",
+                "arguments": {"command": "ls -a", "description": "list files"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "c1", "success": True, "result": {"content": "a.py\nb.py"}}},
+            {"type": "assistant.message", "timestamp": "2026-08-27T01:45:02Z", "data": {
+                "model": "gpt-5.6-luna", "content": "Two files.", "reasoningText": "checking"}},
+        ]
+        # Two calls in one turn: tokens add, and the last finish_reason ends it.
+        rows = [("sess-1", 0, "gpt-5.6-luna", 15354, 6, 0, 15351, 0, 1773.0, 1676.474934, "tool_calls"),
+                ("sess-1", 0, "gpt-5.6-luna", 82, 300, 15351, 0, 34, 900.4, 500.0, "stop")]
+        with tempfile.TemporaryDirectory() as tmp:
+            found = self._copilot_cli_store(tmp, events, rows)
+            self.assertEqual(len(found), 1)          # the snapshot-only dir is skipped
+            session = found[0].session
+            self.assertEqual((session.provider, session.workspace), ("copilot-cli", "demo"))
+            self.assertEqual(session.agent_version, "1.0.80")
+            req = session.requests[0]
+            self.assertEqual((req.model_id, req.resolved_model), ("gpt-5.6-luna", "gpt-5.6-luna"))
+            self.assertEqual((req.input_tokens, req.completion_tokens), (15436, 306))
+            self.assertEqual((req.cache_read_tokens, req.reasoning_tokens), (15351, 34))
+            # Floats round rather than being discarded, and the turn ends on "stop".
+            self.assertEqual((req.total_elapsed_ms, req.first_progress_ms), (2673, 1676))
+            self.assertEqual(req.stop_reason, "stop")
+            bash = req.tool_calls[0]
+            self.assertEqual((bash.name, bash.command, bash.message), ("bash", "ls -a", "list files"))
+            self.assertEqual((bash.output, bash.is_error), ("a.py\nb.py", False))
+            self.assertEqual([p.kind for p in req.response_parts],
+                             ["tool_call", "thinking", "text"])
+
+    def test_copilot_cli_older_build_and_abort(self):
+        """Builds before usage tracking still yield reasoning, output and aborts."""
+        events = [
+            {"type": "session.start", "timestamp": "2026-04-18T23:03:00Z", "data": {
+                "sessionId": "sess-1", "copilotVersion": "0.0.410",
+                "context": {"cwd": "/work/demo"}}},
+            {"type": "user.message", "timestamp": "2026-04-18T23:06:50Z",
+             "data": {"content": "debug it"}},
+            {"type": "assistant.message", "data": {
+                "content": "Looking.", "reasoningText": "check the logs", "outputTokens": 42}},
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "c1", "toolName": "view", "arguments": {"path": "/var/log"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "c1", "success": False, "result": {"content": "denied"}}},
+            {"type": "abort", "data": {"reason": "user_initiated"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._copilot_cli_store(tmp, events)[0].session
+            req = session.requests[0]
+            # No sqlite row, so the event's own count is used instead.
+            self.assertEqual(req.completion_tokens, 42)
+            self.assertTrue(req.is_incomplete)
+            self.assertEqual(req.error_code, "aborted")
+            view = req.tool_calls[0]
+            self.assertEqual((view.output, view.is_error), ("denied", True))
+            self.assertIn('"path": "/work/demo"'.replace("/work/demo", "/var/log"), view.arguments)
 
     def test_agy_unknown_protobuf(self):
         with tempfile.TemporaryDirectory() as tmp:
