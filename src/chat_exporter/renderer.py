@@ -427,14 +427,10 @@ def _render_header(session: ChatSession, include_metrics: bool) -> list[str]:
             lines.append(f"**Time generating:** {active}  ")
         tokens = session.total_completion_tokens
         if tokens:
-            context = [
-                (session.total_input_tokens, "input"),
-                (session.total_cache_read_tokens, "cached"),
-            ]
-            extra = ", ".join(f"{count:,} {label}" for count, label in context if count)
-            lines.append(
-                f"**Completion tokens:** {tokens:,}" + (f"  ({extra})" if extra else "") + "  "
-            )
+            lines.append(f"**Completion tokens:** {tokens:,}  ")
+        peak = session.peak_context_tokens
+        if peak:
+            lines.append(f"**Peak context:** {peak:,} tokens  ")
 
         tools = session.tool_counts
         if tools:
@@ -519,8 +515,7 @@ def render_session_json(
     data["span_ms"] = session.span_ms
     data["total_elapsed_ms"] = session.total_elapsed_ms
     data["total_completion_tokens"] = session.total_completion_tokens
-    data["total_input_tokens"] = session.total_input_tokens
-    data["total_cache_read_tokens"] = session.total_cache_read_tokens
+    data["peak_context_tokens"] = session.peak_context_tokens
     data["total_tool_calls"] = session.total_tool_calls
     data["models_used"] = dict(session.models_used)
     data["tool_counts"] = dict(session.tool_counts)

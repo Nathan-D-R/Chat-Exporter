@@ -42,14 +42,24 @@ class ProviderTests(unittest.TestCase):
             rows = [
                 {"type": "user", "uuid": "u1", "timestamp": "2026-01-01T00:00:00Z",
                  "cwd": "/work/demo", "message": {"role": "user", "content": "run it"}},
+                # One API response is written as one record per content block,
+                # each repeating that call's usage under the same message id.
+                # Its 10 output tokens must be counted once, not once per block.
                 {"type": "assistant", "timestamp": "2026-01-01T00:00:02Z",
-                 "message": {"role": "assistant", "model": "claude-test", "stop_reason": "tool_use",
+                 "message": {"role": "assistant", "id": "msg_a", "model": "claude-test",
+                             "stop_reason": "tool_use",
                              "usage": {"output_tokens": 10, "input_tokens": 5,
                                        "cache_read_input_tokens": 900,
                                        "cache_creation_input_tokens": 40},
                              "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
-                                          "input": {"command": "ls", "description": "list"}},
-                                         {"type": "tool_use", "id": "t2", "name": "Edit",
+                                          "input": {"command": "ls", "description": "list"}}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:02Z",
+                 "message": {"role": "assistant", "id": "msg_a", "model": "claude-test",
+                             "stop_reason": "tool_use",
+                             "usage": {"output_tokens": 10, "input_tokens": 5,
+                                       "cache_read_input_tokens": 900,
+                                       "cache_creation_input_tokens": 40},
+                             "content": [{"type": "tool_use", "id": "t2", "name": "Edit",
                                           "input": {"file_path": "/work/demo/a.py"}}]}},
                 # Tool results arrive as user messages and must not open a new turn.
                 {"type": "user", "timestamp": "2026-01-01T00:00:03Z",
@@ -61,9 +71,18 @@ class ProviderTests(unittest.TestCase):
                  "message": {"role": "user", "content": [
                      {"type": "tool_result", "tool_use_id": "t2", "is_error": True,
                       "content": [{"type": "text", "text": "no match"}]}]}},
+                # A second call in the same turn. Streaming can revise a count
+                # upward under one id; the last record carries the final value.
                 {"type": "assistant", "timestamp": "2026-01-01T00:00:05Z",
-                 "message": {"role": "assistant", "model": "claude-test", "stop_reason": "end_turn",
+                 "message": {"role": "assistant", "id": "msg_b", "model": "claude-test",
+                             "stop_reason": "end_turn",
                              "usage": {"output_tokens": 4, "input_tokens": 6,
+                                       "cache_read_input_tokens": 1200},
+                             "content": [{"type": "text", "text": "done"}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:05Z",
+                 "message": {"role": "assistant", "id": "msg_b", "model": "claude-test",
+                             "stop_reason": "end_turn",
+                             "usage": {"output_tokens": 9, "input_tokens": 6,
                                        "cache_read_input_tokens": 1200},
                              "content": [{"type": "text", "text": "done"}]}},
             ]
@@ -75,8 +94,9 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual((bash.output, bash.command, bash.message), ("a.py\n", "ls", "list"))
             self.assertEqual((edit.output, edit.is_error), ("no match", True))
             self.assertEqual(req.edited_files, ["/work/demo/a.py"])
-            # Output accumulates across the turn; context figures are the last call's.
-            self.assertEqual((req.completion_tokens, req.input_tokens), (14, 6))
+            # 10 for msg_a counted once despite two records, plus msg_b's
+            # revised 9 rather than its superseded 4. Context is the last call's.
+            self.assertEqual((req.completion_tokens, req.input_tokens), (19, 6))
             self.assertEqual((req.cache_read_tokens, req.cache_write_tokens), (1200, 40))
             self.assertEqual((req.stop_reason, req.total_elapsed_ms), ("end_turn", 5000))
 
@@ -167,6 +187,55 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual((req.total_elapsed_ms, req.first_progress_ms), (4200, 300))
             session = parse_codex(path)
             self.assertEqual((session.git_branch, session.agent_version), ("main", "0.1.0"))
+
+    def test_codex_file_change_list_shape(self):
+        """`changes` may be a list of {path, kind} rather than a path-keyed object."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-id.jsonl"
+            rows = [
+                {"type": "session_meta", "payload": {"id": "s1", "cwd": "/work/demo",
+                                                     "timestamp": "2026-01-01T00:00:00Z"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hello"}]}},
+                {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                    "type": "FileChange", "changes": [
+                        {"path": "/work/demo/a.py", "kind": "update"},
+                        {"path": "/work/demo/b.py", "kind": "add"},
+                    ]}}},
+            ]
+            path.write_text("\n".join(json.dumps(x) for x in rows))
+            session = parse_codex(path)
+            self.assertEqual(session.requests[0].edited_files,
+                             ["/work/demo/a.py", "/work/demo/b.py"])
+
+    def test_codex_command_join_does_not_steal(self):
+        """A CommandExecution must not overwrite an unrelated earlier call.
+
+        The second turn's event belongs to a shell invocation this parser does
+        not record as a function_call, so it must attach to nothing rather than
+        to the still-pending call from the first turn.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-id.jsonl"
+            rows = [
+                {"type": "session_meta", "payload": {"id": "s1", "cwd": "/work/demo",
+                                                     "timestamp": "2026-01-01T00:00:00Z"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "first"}]}},
+                # A non-shell call, so no CommandExecution ever arrives for it.
+                {"type": "response_item", "payload": {"type": "function_call", "name": "web_search",
+                                                      "call_id": "c1", "arguments": "{}"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "second"}]}},
+                {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                    "type": "CommandExecution", "id": "exec-9", "command": ["sh", "-c", "rm -rf x"],
+                    "cwd": "/work/demo", "exit_code": 0, "aggregated_output": "gone"}}},
+            ]
+            path.write_text("\n".join(json.dumps(x) for x in rows))
+            session = parse_codex(path)
+            search = session.requests[0].tool_calls[0]
+            self.assertEqual((search.name, search.command, search.output), ("web_search", "", ""))
+            self.assertIsNone(search.exit_code)
 
     def test_agy_unknown_protobuf(self):
         with tempfile.TemporaryDirectory() as tmp:

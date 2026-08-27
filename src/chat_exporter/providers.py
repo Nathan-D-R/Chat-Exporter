@@ -171,20 +171,40 @@ def _claude_tool_result(
         )
 
 
-def _claude_assistant(item: dict[str, Any], request: ChatRequest, tools: dict[str, ToolCall]) -> None:
+def _claude_assistant(
+    item: dict[str, Any],
+    request: ChatRequest,
+    tools: dict[str, ToolCall],
+    usage_seen: dict[str, int],
+) -> None:
     message = _dict(item.get("message"))
     request.model_id = message.get("model") or request.model_id
     stop = message.get("stop_reason")
     if stop:
         request.stop_reason = str(stop)
 
-    # A turn is many API calls. Output tokens accumulate across them; the input
-    # and cache figures are the context size of one call, so the last call of
-    # the turn is the meaningful one rather than a running total.
+    # A turn is many API calls, and each call is written as one record per
+    # content block, every record repeating that call's usage. Counting per
+    # record therefore charges a response once per block: across this corpus
+    # 1,641 of 2,090 message ids repeat, inflating output tokens ~2.3x.
+    #
+    # So accumulate per message id, not per record. A repeated id usually
+    # carries an identical count, but streaming can revise it upward, and the
+    # final record holds the larger value in nearly every observed case; take
+    # the last value seen for an id and correct the running total by the
+    # difference. Input and cache figures are the context size of a single
+    # call, so the last call of the turn is the meaningful one either way.
     usage = _dict(message.get("usage"))
     output_tokens = _int(usage.get("output_tokens"))
+    message_id = message.get("id")
     if output_tokens is not None:
-        request.completion_tokens = (request.completion_tokens or 0) + output_tokens
+        if isinstance(message_id, str):
+            previous = usage_seen.get(message_id)
+            usage_seen[message_id] = output_tokens
+            delta = output_tokens - previous if previous is not None else output_tokens
+        else:
+            delta = output_tokens
+        request.completion_tokens = (request.completion_tokens or 0) + delta
     for attr, key in (
         ("input_tokens", "input_tokens"),
         ("cache_read_tokens", "cache_read_input_tokens"),
@@ -241,6 +261,8 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
     requests: list[ChatRequest] = []
     current: ChatRequest | None = None
     tools: dict[str, ToolCall] = {}
+    # message id -> last output_tokens seen, so repeated records are not double counted
+    usage_seen: dict[str, int] = {}
     model = ""
     for item in records:
         message = _dict(item.get("message"))
@@ -269,7 +291,7 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
                 requests.append(current)
         elif role == "assistant" and current:
             model = message.get("model") or model
-            _claude_assistant(item, current, tools)
+            _claude_assistant(item, current, tools, usage_seen)
             end_ms = _ms(item.get("timestamp"))
             if end_ms and current.timestamp_ms:
                 current.total_elapsed_ms = max(end_ms - current.timestamp_ms, 0)
@@ -320,6 +342,25 @@ def _codex_usage(request: ChatRequest, info: dict[str, Any]) -> None:
         value = _int(usage.get(key))
         if value is not None:
             setattr(request, attr, (getattr(request, attr) or 0) + value)
+
+
+def _codex_changed_paths(changes: Any) -> list[str]:
+    """Paths from a FileChange item, which may key them or list them.
+
+    The thread-item schema carries `changes` either as a path-keyed object or
+    as a list of {path, kind} entries; reading only the first shape made the
+    feature a silent no-op against the second.
+    """
+    if isinstance(changes, dict):
+        return [str(name) for name in changes]
+    if isinstance(changes, list):
+        paths = []
+        for entry in changes:
+            path = _dict(entry).get("path") if isinstance(entry, dict) else entry
+            if path:
+                paths.append(str(path))
+        return paths
+    return []
 
 
 def _codex_command(tool: ToolCall, item: dict[str, Any], event: dict[str, Any]) -> None:
@@ -379,11 +420,25 @@ def parse_codex(path: Path) -> ChatSession | None:
                 current.first_progress_ms = _int(payload.get("time_to_first_token_ms"))
             elif kind == "item_completed":
                 item = _dict(payload.get("item"))
-                if item.get("type") == "CommandExecution" and last_tool is not None:
-                    _codex_command(last_tool, item, payload)
+                if item.get("type") == "CommandExecution":
+                    # The event carries its own exec-<uuid> id rather than the
+                    # call_id, so the join is positional: it follows the call
+                    # that ran it. Match on call_id when the event does carry
+                    # one, and otherwise only consume a call still awaiting its
+                    # command, so an event from a shell invocation recorded
+                    # some other way cannot overwrite an unrelated call.
+                    target = None
+                    event_call_id = item.get("call_id") or payload.get("call_id")
+                    if event_call_id:
+                        part = tool_calls.get(event_call_id)
+                        target = part.tool if part and part.tool else None
+                    if target is None and last_tool is not None and not last_tool.command:
+                        target = last_tool
+                    if target is not None:
+                        _codex_command(target, item, payload)
                     last_tool = None
                 elif item.get("type") == "FileChange":
-                    current.edited_files.extend(str(name) for name in _dict(item.get("changes")))
+                    current.edited_files.extend(_codex_changed_paths(item.get("changes")))
             continue
         if row_type != "response_item":
             continue
@@ -395,6 +450,7 @@ def parse_codex(path: Path) -> ChatSession | None:
                 current = ChatRequest(timestamp_ms=_ms(row.get("timestamp")), user_text=text,
                                       model_id=model)
                 requests.append(current)
+                last_tool = None
             elif role == "assistant" and current and text:
                 current.response_parts.append(ResponsePart("text", text=text))
         elif kind in ("function_call", "custom_tool_call") and current:
