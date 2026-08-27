@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from chat_exporter.parser import parse_session
 from chat_exporter.providers import discover_opencode, parse_agy, parse_claude, parse_codex
 
 
@@ -236,6 +237,74 @@ class ProviderTests(unittest.TestCase):
             search = session.requests[0].tool_calls[0]
             self.assertEqual((search.name, search.command, search.output), ("web_search", "", ""))
             self.assertIsNone(search.exit_code)
+
+    def _copilot_session(self, tmp, rounds, extra_metadata=None, completion=None):
+        """Write a minimal copilot chat store shaped like the real event log."""
+        path = Path(tmp) / "session.jsonl"
+        request = {
+            "requestId": "r1", "timestamp": 1775178266074, "modelId": "copilot/auto",
+            "message": {"text": "do it"},
+            "response": [{"kind": "toolInvocationSerialized", "toolId": "copilot_findFiles",
+                          "toolCallId": "call_1", "isComplete": True,
+                          "invocationMessage": {"value": "Searching"}}],
+            "result": {"metadata": dict({
+                "resolvedModel": "claude-sonnet-4-6",
+                "promptTokens": 21413,
+                "outputTokens": 71,
+                "toolCallRounds": rounds,
+            }, **(extra_metadata or {}))},
+        }
+        if completion is not None:
+            request["completionTokens"] = completion
+        rows = [
+            {"kind": 0, "v": {"sessionId": "s1", "creationDate": 1775178266000, "requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [request]},
+        ]
+        path.write_text("\n".join(json.dumps(x) for x in rows))
+        return parse_session(path)
+
+    def test_copilot_metadata_usage_and_model(self):
+        """promptTokens, resolvedModel, and the single-round token fallback."""
+        one_round = [{"id": "call_1__vscode-1", "toolCalls": [
+            {"id": "call_1__vscode-1", "name": "file_search", "arguments": '{"query": "*.py"}'}]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._copilot_session(tmp, one_round)
+            req = session.requests[0]
+            self.assertEqual(req.resolved_model, "claude-sonnet-4-6")
+            self.assertEqual(req.input_tokens, 21413)
+            # One round, so metadata.outputTokens is the whole turn's output.
+            self.assertEqual(req.completion_tokens, 71)
+            self.assertEqual(session.peak_context_tokens, 21413)
+
+    def test_copilot_multi_round_does_not_use_output_tokens(self):
+        """outputTokens is only the last round, so it must not stand in."""
+        two_rounds = [
+            {"id": "call_1__vscode-1", "toolCalls": [
+                {"id": "call_1__vscode-1", "name": "file_search", "arguments": "{}"}]},
+            {"id": "call_2__vscode-2", "toolCalls": []},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._copilot_session(tmp, two_rounds)
+            self.assertIsNone(session.requests[0].completion_tokens)
+        # An explicit completionTokens is the turn total and always wins.
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._copilot_session(tmp, two_rounds, completion=3067)
+            self.assertEqual(session.requests[0].completion_tokens, 3067)
+
+    def test_copilot_tool_results_from_metadata(self):
+        """Output kept only in metadata.toolCallResults is recovered."""
+        rounds = [{"id": "call_1__vscode-1", "toolCalls": [
+            {"id": "call_1__vscode-1", "name": "file_search", "arguments": "{}"}]}]
+        results = {"toolCallResults": {"call_1__vscode-1": {"content": [{"value": {"node": {
+            "children": [
+                {"text": "736 total results"},
+                {"children": [{"text": "/work/demo/a.py"}]},
+            ]}}}]}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._copilot_session(tmp, rounds, extra_metadata=results)
+            tool = session.requests[0].tool_calls[0]
+            self.assertEqual(tool.name, "file_search")
+            self.assertEqual(tool.output, "736 total results\n/work/demo/a.py")
 
     def test_agy_unknown_protobuf(self):
         with tempfile.TemporaryDirectory() as tmp:
