@@ -951,10 +951,28 @@ def discover_copilot_cli(root: Path | None = None) -> Iterable[DiscoveredSession
             yield DiscoveredSession("copilot-cli", directory.name, path, None, str(exc))
 
 
-def discover(providers: set[str], config_root: Path | None = None) -> list[DiscoveredSession]:
+def discover(
+    providers: set[str],
+    config_root: Path | None = None,
+    roots: dict[str, Path] | None = None,
+) -> list[DiscoveredSession]:
+    """Discover sessions for the named providers.
+
+    `roots` overrides where a provider's store is read from, which is what
+    makes a store outside the current home reachable: one copied out of a
+    container, restored from a backup, or belonging to another user.
+    """
+    roots = roots or {}
     adapters = {
-        "copilot": lambda: discover_copilot(config_root), "agy": discover_agy,
+        "copilot": discover_copilot, "agy": discover_agy,
         "copilot-cli": discover_copilot_cli,
         "claude": discover_claude, "codex": discover_codex, "opencode": discover_opencode,
     }
-    return [item for name in PROVIDERS if name in providers for item in adapters[name]()]
+    # --config-root predates --root and stays an alias for the extension's store.
+    default = {"copilot": config_root} if config_root else {}
+    return [
+        item
+        for name in PROVIDERS
+        if name in providers
+        for item in adapters[name](roots.get(name, default.get(name)))
+    ]

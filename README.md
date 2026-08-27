@@ -71,7 +71,10 @@ Options:
   --include-context        List the context files attached to each turn
   --min-messages N         Minimum user messages (default: 1)
   --list                   List discovered sessions without exporting
+  --root NAME=PATH         Read a provider's sessions from PATH instead of its
+                           default location; repeatable
   --config-root PATH       Override VS Code User config root for Copilot
+                           (alias for --root copilot=PATH)
 ```
 
 Provider names are `copilot`, `agy`, `claude`, `codex`, and `opencode`.
@@ -96,6 +99,10 @@ chat-exporter --format json -o ~/chat-json
 
 # Reading copy: prose only, no tool noise or metrics
 chat-exporter --no-tools --no-metrics --no-file-edits
+
+# Export a store from somewhere other than the current home: one copied out
+# of a container, restored from a backup, or belonging to another user
+chat-exporter --root copilot-cli=/mnt/backup/.copilot
 ```
 
 ## Output

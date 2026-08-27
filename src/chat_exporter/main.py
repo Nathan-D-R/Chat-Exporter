@@ -46,7 +46,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-messages", type=int, default=1, metavar="N")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--config-root", metavar="PATH",
-                        help="Override the VS Code User config directory for Copilot")
+                        help="Override the VS Code User config directory for Copilot"
+                             " (alias for --root copilot=PATH)")
+    parser.add_argument("--root", action="append", default=[], metavar="NAME=PATH",
+                        dest="roots",
+                        help="Read a provider's sessions from PATH instead of its default"
+                             f" location; repeatable. NAME is one of: {', '.join(PROVIDERS)}")
     return parser
 
 
@@ -96,6 +101,22 @@ class RenderOptions:
             include_tool_args=self.include_tool_args,
             max_tool_output=self.max_tool_output,
         )
+
+
+def _parse_roots(parser: argparse.ArgumentParser, values: list[str]) -> dict[str, Path]:
+    roots: dict[str, Path] = {}
+    for value in values:
+        name, sep, raw = value.partition("=")
+        name, raw = name.strip(), raw.strip()
+        if not sep or not name or not raw:
+            parser.error(f"--root expects NAME=PATH, got {value!r}")
+        if name not in PROVIDERS:
+            parser.error(f"--root: unknown provider {name!r}; choose from {', '.join(PROVIDERS)}")
+        path = Path(raw).expanduser()
+        if not path.is_dir():
+            parser.error(f"--root: {path} is not a directory")
+        roots[name] = path
+    return roots
 
 
 def _workspace_matches(name: str, filters: list[str]) -> bool:
@@ -166,7 +187,9 @@ def main() -> None:
     if args.min_messages < 0:
         parser.error("--min-messages must be zero or greater")
     providers = set(args.provider or PROVIDERS)
-    items = _filtered(discover(providers, Path(args.config_root) if args.config_root else None), args)
+    roots = _parse_roots(parser, args.roots)
+    config_root = Path(args.config_root) if args.config_root else None
+    items = _filtered(discover(providers, config_root, roots), args)
     try:
         if args.list:
             _run_list(items)

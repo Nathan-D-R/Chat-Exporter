@@ -6,6 +6,7 @@ from pathlib import Path
 
 from chat_exporter.parser import parse_session
 from chat_exporter.providers import (
+    discover,
     discover_copilot_cli,
     discover_opencode,
     parse_agy,
@@ -401,6 +402,25 @@ class ProviderTests(unittest.TestCase):
             view = req.tool_calls[0]
             self.assertEqual((view.output, view.is_error), ("denied", True))
             self.assertIn('"path": "/work/demo"'.replace("/work/demo", "/var/log"), view.arguments)
+
+    def test_discover_honours_provider_roots(self):
+        """A store outside the current home is reachable via `roots`."""
+        events = [
+            {"type": "session.start", "timestamp": "2026-08-27T01:44:55Z", "data": {
+                "sessionId": "sess-1", "copilotVersion": "1.0.80",
+                "context": {"cwd": "/work/demo"}}},
+            {"type": "user.message", "timestamp": "2026-08-27T01:45:00Z",
+             "data": {"content": "hello"}},
+            {"type": "assistant.message", "data": {"model": "gpt-5.6-luna", "content": "hi"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self._copilot_cli_store(tmp, events)
+            # Nothing is found at the default location for this temp store...
+            relocated = discover({"copilot-cli"}, roots={"copilot-cli": Path(tmp)})
+            self.assertEqual(len(relocated), 1)
+            session = relocated[0].session
+            self.assertEqual((session.provider, session.workspace), ("copilot-cli", "demo"))
+            self.assertEqual(session.requests[0].assistant_text, "hi")
 
     def test_agy_unknown_protobuf(self):
         with tempfile.TemporaryDirectory() as tmp:
