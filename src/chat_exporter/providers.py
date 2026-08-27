@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import operator
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -630,17 +631,27 @@ def _opencode_tool(part: dict[str, Any]) -> ToolCall:
 
 
 def _opencode_usage(request: ChatRequest, info: dict[str, Any]) -> None:
+    """Fold one call's usage into the turn it belongs to.
+
+    A turn makes a call per tool round. Tokens generated accumulate across
+    them, but input and cache reads are the context size of a single call and
+    peak instead: summing them reported 2,428,247 context tokens for one turn
+    here, several times any context that existed.
+    """
     cache = _dict(info.get("cache"))
-    for attr, source, key in (
-        ("completion_tokens", info, "output"),
-        ("input_tokens", info, "input"),
-        ("reasoning_tokens", info, "reasoning"),
-        ("cache_read_tokens", cache, "read"),
-        ("cache_write_tokens", cache, "write"),
+    for attr, source, key, combine in (
+        # Generated, so they accumulate across the turn's calls.
+        ("completion_tokens", info, "output", operator.add),
+        ("reasoning_tokens", info, "reasoning", operator.add),
+        ("cache_write_tokens", cache, "write", operator.add),
+        # One call's context, so they peak.
+        ("input_tokens", info, "input", max),
+        ("cache_read_tokens", cache, "read", max),
     ):
         value = _int(source.get(key))
         if value is not None:
-            setattr(request, attr, (getattr(request, attr) or 0) + value)
+            current = getattr(request, attr)
+            setattr(request, attr, value if current is None else combine(current, value))
 
 
 def _opencode_message(info: dict[str, Any], parts: list[dict[str, Any]], current: ChatRequest | None) -> ChatRequest | None:
@@ -780,14 +791,21 @@ def _copilot_cli_usage(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
             )
             for row in rows:
                 key = (str(row["session_id"]), _int(row["turn_index"]) or 0)
-                # A turn can make several calls; tokens add up, and the last
-                # call's finish_reason is the one that ended the turn.
                 entry = usage.setdefault(key, {})
-                for field in ("input_tokens", "output_tokens", "cache_read_tokens",
-                              "cache_write_tokens", "reasoning_tokens", "duration_ms"):
+                # A turn makes several calls. Tokens generated and time spent
+                # accumulate across them, but input and cache reads are the
+                # context size of one call, so they peak rather than add.
+                # Summing them reported 1,455,592 context tokens for a 20-call
+                # turn whose largest context was 79,704.
+                for field in ("output_tokens", "cache_write_tokens",
+                              "reasoning_tokens", "duration_ms"):
                     value = _duration(row[field])
                     if value is not None:
                         entry[field] = entry.get(field, 0) + value
+                for field in ("input_tokens", "cache_read_tokens"):
+                    value = _duration(row[field])
+                    if value is not None:
+                        entry[field] = max(entry.get(field, 0), value)
                 # Time to first token belongs to the turn's first call, while
                 # the reason it stopped belongs to its last.
                 for field in ("time_to_first_token_ms", "model"):

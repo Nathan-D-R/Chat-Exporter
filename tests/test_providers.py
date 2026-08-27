@@ -354,7 +354,8 @@ class ProviderTests(unittest.TestCase):
             {"type": "assistant.message", "timestamp": "2026-08-27T01:45:02Z", "data": {
                 "model": "gpt-5.6-luna", "content": "Two files.", "reasoningText": "checking"}},
         ]
-        # Two calls in one turn: tokens add, and the last finish_reason ends it.
+        # Two calls in one turn. Output, cache writes and reasoning accumulate;
+        # input and cache reads are one call's context, so they peak instead.
         rows = [("sess-1", 0, "gpt-5.6-luna", 15354, 6, 0, 15351, 0, 1773.0, 1676.474934, "tool_calls"),
                 ("sess-1", 0, "gpt-5.6-luna", 82, 300, 15351, 0, 34, 900.4, 500.0, "stop")]
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,8 +366,12 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(session.agent_version, "1.0.80")
             req = session.requests[0]
             self.assertEqual((req.model_id, req.resolved_model), ("gpt-5.6-luna", "gpt-5.6-luna"))
-            self.assertEqual((req.input_tokens, req.completion_tokens), (15436, 306))
+            # 15354 is the larger context, not 15354 + 82.
+            self.assertEqual((req.input_tokens, req.completion_tokens), (15354, 306))
             self.assertEqual((req.cache_read_tokens, req.reasoning_tokens), (15351, 34))
+            self.assertEqual(req.cache_write_tokens, 15351)
+            # Peak context is one call's input plus its cache reads.
+            self.assertEqual(session.peak_context_tokens, 15354 + 15351)
             # Floats round rather than being discarded, and the turn ends on "stop".
             self.assertEqual((req.total_elapsed_ms, req.first_progress_ms), (2673, 1676))
             self.assertEqual(req.stop_reason, "stop")
@@ -486,8 +491,14 @@ class ProviderTests(unittest.TestCase):
                          "time": {"created": 100, "completed": 2600},
                          "tokens": {"input": 40, "output": 9, "reasoning": 2,
                                     "cache": {"read": 700, "write": 5}}}
+            # A second call in the same turn, as every tool round makes one.
+            assistant2 = {"role": "assistant", "modelID": "glm", "finish": "stop", "mode": "build",
+                          "time": {"created": 2700, "completed": 3600},
+                          "tokens": {"input": 5000, "output": 300, "reasoning": 3,
+                                     "cache": {"read": 60000, "write": 7}}}
             db.executemany("insert into message values (?, ?, ?, ?)", [
-                ("m1", "s1", 2, '{"role":"user"}'), ("m2", "s1", 3, json.dumps(assistant))])
+                ("m1", "s1", 2, '{"role":"user"}'), ("m2", "s1", 3, json.dumps(assistant)),
+                ("m3", "s1", 4, json.dumps(assistant2))])
             db.executemany("insert into part values (?, ?, ?)", [
                 ("p1", "m1", '{"type":"text","text":"hello"}'),
                 ("p2", "m2", json.dumps({"type": "tool", "tool": "bash", "callID": "c1", "state": {
@@ -506,9 +517,12 @@ class ProviderTests(unittest.TestCase):
                              ("ls", 0, "list files", 30))
             self.assertEqual((read.is_error, read.output), (True, "File not found"))
             self.assertEqual((req.model_id, req.stop_reason, req.mode_name), ("glm", "stop", "build"))
-            self.assertEqual((req.completion_tokens, req.input_tokens), (9, 40))
-            self.assertEqual((req.cache_read_tokens, req.cache_write_tokens), (700, 5))
-            self.assertEqual((req.reasoning_tokens, req.total_elapsed_ms), (2, 2500))
+            # Output, cache writes and reasoning accumulate across the calls,
+            # while input and cache reads are one call's context and peak.
+            self.assertEqual((req.completion_tokens, req.input_tokens), (309, 5000))
+            self.assertEqual((req.cache_read_tokens, req.cache_write_tokens), (60000, 12))
+            self.assertEqual(req.reasoning_tokens, 5)
+            self.assertEqual(session.peak_context_tokens, 65000)
             # No model on the session row, so it falls back to the turns.
             self.assertEqual((session.model_id, session.agent_version), ("glm", "1.2.3"))
 

@@ -237,7 +237,14 @@ def _render_tool_call(
             lines += [f"_cwd: `{_short_path(tool.cwd)}`_", ""]
 
     if include_args and tool.arguments and not tool.command:
-        lines += ["**Arguments:**", "", _fence(tool.arguments.strip(), "json"), ""]
+        # Not every tool takes JSON: the CLI's apply_patch takes a raw patch.
+        body = tool.arguments.strip()
+        try:
+            json.loads(body)
+            language = "json"
+        except (json.JSONDecodeError, ValueError):
+            language = "diff" if body.startswith("*** ") else ""
+        lines += ["**Arguments:**", "", _fence(body, language), ""]
 
     if tool.todos:
         lines.append("**Todo list:**")
