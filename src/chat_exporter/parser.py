@@ -145,6 +145,7 @@ class ChatRequest:
     request_id: str = ""
     timestamp_ms: int = 0
     model_id: str = ""
+    resolved_model: str = ""
     user_text: str = ""
     is_system_initiated: bool = False
     system_label: str = ""
@@ -411,6 +412,50 @@ def _parse_response(raw_response: list[Any]) -> list[ResponsePart]:
     return parts
 
 
+def _prompt_element_text(node: Any, out: list[str], depth: int = 0) -> None:
+    """Collect text from a serialized prompt-element tree.
+
+    metadata.toolCallResults stores what a tool actually returned to the model
+    as a nested render tree rather than a string, so the text lives on `text`
+    keys scattered through it.
+    """
+    if depth > 40:
+        return
+    if isinstance(node, dict):
+        text = node.get("text")
+        if isinstance(text, str) and text:
+            out.append(text)
+        for value in node.values():
+            _prompt_element_text(value, out, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            _prompt_element_text(value, out, depth + 1)
+
+
+def _apply_tool_results(req: ChatRequest, metadata: dict[str, Any]) -> None:
+    """Fill tool output from metadata.toolCallResults.
+
+    Only about 43% of calls record output on the response part itself; the
+    rest kept it here, which lifts coverage to roughly 80%. Keys carry the
+    same '__vscode-<n>' suffix the rounds use.
+    """
+    results = metadata.get("toolCallResults")
+    if not isinstance(results, dict):
+        return
+    by_id = {str(k).split("__vscode-")[0]: v for k, v in results.items()}
+    for tool in req.tool_calls:
+        if tool.output:
+            continue
+        entry = by_id.get(tool.call_id)
+        if entry is None:
+            continue
+        chunks: list[str] = []
+        _prompt_element_text(entry, chunks)
+        joined = "\n".join(chunks).strip()
+        if joined:
+            tool.output = joined
+
+
 def _apply_tool_arguments(req: ChatRequest, result: dict[str, Any]) -> None:
     """Merge tool names and argument JSON from result.metadata.toolCallRounds.
 
@@ -418,6 +463,11 @@ def _apply_tool_arguments(req: ChatRequest, result: dict[str, Any]) -> None:
     toolCallId does not, so match on the prefix.
     """
     metadata = _as_dict(result.get("metadata"))
+    _apply_tool_results(req, metadata)
+
+    req.resolved_model = str(metadata.get("resolvedModel") or "")
+    req.input_tokens = _as_int(metadata.get("promptTokens"))
+
     rounds = metadata.get("toolCallRounds")
     if not isinstance(rounds, list):
         return
@@ -445,6 +495,13 @@ def _apply_tool_arguments(req: ChatRequest, result: dict[str, Any]) -> None:
                     tool.arguments = args
             elif isinstance(args, (dict, list)):
                 tool.arguments = json.dumps(args, indent=2)
+
+    # completionTokens is the turn's cumulative output across its rounds, while
+    # metadata.outputTokens is only the final round: they agree on all 36
+    # single-round turns in this corpus and never on a multi-round one. So the
+    # fallback is safe for a lone round and would undercount anywhere else.
+    if req.completion_tokens is None and len(rounds) == 1:
+        req.completion_tokens = _as_int(metadata.get("outputTokens"))
 
 
 # ---------------------------------------------------------------------------

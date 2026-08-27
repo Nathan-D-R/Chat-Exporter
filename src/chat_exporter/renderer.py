@@ -287,7 +287,15 @@ def _assistant_meta(req: ChatRequest, include_metrics: bool) -> str:
         return ""
     bits: list[str] = []
     if req.model_id:
-        bits.append(f"`{req.model_id}`")
+        # `copilot/auto` names a router, not a model; the metadata records what
+        # it actually picked, so show that rather than leave the turn ambiguous.
+        resolved = req.resolved_model
+        if resolved and resolved not in req.model_id:
+            bits.append(f"`{req.model_id}` -> `{resolved}`")
+        else:
+            bits.append(f"`{req.model_id}`")
+    elif req.resolved_model:
+        bits.append(f"`{req.resolved_model}`")
     duration = _fmt_duration(req.duration_ms)
     if duration:
         bits.append(duration)
