@@ -244,12 +244,19 @@ class ChatSession:
         return sum(r.completion_tokens or 0 for r in self.requests)
 
     @property
-    def total_input_tokens(self) -> int:
-        return sum(r.input_tokens or 0 for r in self.requests)
+    def peak_context_tokens(self) -> int:
+        """Largest context a single turn was sent, fresh plus cached.
 
-    @property
-    def total_cache_read_tokens(self) -> int:
-        return sum(r.cache_read_tokens or 0 for r in self.requests)
+        Input and cache figures are a point-in-time context size, not a
+        quantity produced, so they do not sum across turns the way completion
+        tokens do. Providers also disagree on them: claude records one call's
+        snapshot while codex and opencode accumulate a turn's calls. A maximum
+        is the one reading that holds either way.
+        """
+        return max(
+            ((r.input_tokens or 0) + (r.cache_read_tokens or 0) for r in self.requests),
+            default=0,
+        )
 
     @property
     def total_elapsed_ms(self) -> int:
