@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from .discovery import find_workspace_storage_dirs, get_workspace_name, list_chat_session_files
 from .parser import ChatRequest, ChatSession, ResponsePart, SubagentCall, ToolCall, parse_session
 
-PROVIDERS = ("copilot", "agy", "claude", "codex", "opencode")
+PROVIDERS = ("copilot", "copilot-cli", "agy", "claude", "codex", "opencode")
 
 
 @dataclass
@@ -58,6 +58,19 @@ def _dict(value: Any) -> dict[str, Any]:
 def _int(value: Any) -> int | None:
     """Ints only - bools are ints in Python and never a useful count here."""
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _duration(value: Any) -> int | None:
+    """Milliseconds from a count that may be fractional.
+
+    The CLI's sqlite index stores latencies as floats (1676.474934), which
+    _int deliberately refuses.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return round(value)
+    return None
 
 
 def _title(requests: list[ChatRequest], fallback: str) -> str:
@@ -740,9 +753,208 @@ def discover_opencode(root: Path | None = None) -> Iterable[DiscoveredSession]:
             yield DiscoveredSession("opencode", "Unknown", path, None, str(exc))
 
 
+# ---------------------------------------------------------------------------
+# GitHub Copilot CLI
+#
+# Distinct from the `copilot` provider above, which reads the VS Code
+# extension's workspaceStorage. The CLI keeps its own store under ~/.copilot:
+# one event log per session in session-state/<id>/events.jsonl, plus a sqlite
+# index whose assistant_usage_events table holds the per-turn token and timing
+# figures the event log does not carry.
+# ---------------------------------------------------------------------------
+
+def _copilot_cli_usage(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
+    """Per-turn usage from the CLI's sqlite index, keyed by session and turn."""
+    store = root / "session-store.db"
+    if not store.is_file():
+        return {}
+    usage: dict[tuple[str, int], dict[str, Any]] = {}
+    try:
+        with sqlite3.connect(f"file:{store}?mode=ro", uri=True) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT session_id, turn_index, model, input_tokens, output_tokens,"
+                " cache_read_tokens, cache_write_tokens, reasoning_tokens, duration_ms,"
+                " time_to_first_token_ms, finish_reason FROM assistant_usage_events"
+                " ORDER BY id"
+            )
+            for row in rows:
+                key = (str(row["session_id"]), _int(row["turn_index"]) or 0)
+                # A turn can make several calls; tokens add up, and the last
+                # call's finish_reason is the one that ended the turn.
+                entry = usage.setdefault(key, {})
+                for field in ("input_tokens", "output_tokens", "cache_read_tokens",
+                              "cache_write_tokens", "reasoning_tokens", "duration_ms"):
+                    value = _duration(row[field])
+                    if value is not None:
+                        entry[field] = entry.get(field, 0) + value
+                # Time to first token belongs to the turn's first call, while
+                # the reason it stopped belongs to its last.
+                for field in ("time_to_first_token_ms", "model"):
+                    if row[field] is not None and field not in entry:
+                        entry[field] = row[field]
+                if row["finish_reason"] is not None:
+                    entry["finish_reason"] = row["finish_reason"]
+    except sqlite3.Error:
+        return {}
+    return usage
+
+
+def _copilot_cli_tool(data: dict[str, Any]) -> ToolCall:
+    tool = ToolCall(
+        call_id=str(data.get("toolCallId") or ""),
+        name=str(data.get("toolName") or ""),
+    )
+    arguments = data.get("arguments")
+    if isinstance(arguments, dict):
+        # The shell tool's command reads better as a command than as JSON.
+        command = arguments.get("command")
+        if tool.name == "bash" and isinstance(command, str):
+            tool.command = command
+            tool.message = str(arguments.get("description") or "")
+        else:
+            tool.arguments = json.dumps(arguments, ensure_ascii=False, indent=2)
+    elif arguments is not None:
+        tool.arguments = str(arguments)
+    return tool
+
+
+def parse_copilot_cli(path: Path, usage: dict[tuple[str, int], dict[str, Any]]) -> ChatSession | None:
+    """Parse one session-state/<id>/events.jsonl event log."""
+    requests: list[ChatRequest] = []
+    current: ChatRequest | None = None
+    tools: dict[str, ToolCall] = {}
+    session_id = path.parent.name
+    cwd = ""
+    version = ""
+    created_ms = 0
+    model = ""
+    resolved = ""
+    turn_index = -1
+
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("type")
+        data = _dict(event.get("data"))
+        stamp = _ms(event.get("timestamp"))
+
+        if kind == "session.start":
+            session_id = str(data.get("sessionId") or session_id)
+            version = str(data.get("copilotVersion") or "")
+            cwd = str(_dict(data.get("context")).get("cwd") or "")
+            created_ms = _ms(data.get("startTime")) or stamp
+        elif kind == "session.model_change":
+            model = str(data.get("newModel") or model)
+        elif kind == "session.auto_mode_resolved":
+            # `auto` names a router; this is what it picked.
+            resolved = str(data.get("chosenModel") or "")
+        elif kind == "user.message":
+            text = str(data.get("content") or "")
+            if not text:
+                continue
+            turn_index += 1
+            current = ChatRequest(
+                request_id=str(data.get("interactionId") or ""),
+                timestamp_ms=stamp,
+                user_text=text,
+                model_id=model,
+            )
+            requests.append(current)
+            _copilot_cli_apply_usage(current, usage.get((session_id, turn_index)), resolved)
+        elif current is None:
+            continue
+        elif kind == "assistant.message":
+            current.model_id = str(data.get("model") or current.model_id)
+            # Older CLI builds record no model but do keep reasoning text.
+            reasoning = str(data.get("reasoningText") or "")
+            if reasoning:
+                current.response_parts.append(ResponsePart("thinking", text=reasoning))
+            text = str(data.get("content") or "")
+            if text:
+                current.response_parts.append(ResponsePart("text", text=text))
+            # Only when the sqlite index carried nothing for this turn.
+            if (session_id, turn_index) not in usage:
+                tokens = _int(data.get("outputTokens"))
+                if tokens is not None:
+                    current.completion_tokens = (current.completion_tokens or 0) + tokens
+        elif kind == "tool.execution_start":
+            tool = _copilot_cli_tool(data)
+            current.response_parts.append(ResponsePart("tool_call", tool=tool))
+            if tool.call_id:
+                tools[tool.call_id] = tool
+        elif kind == "tool.execution_complete":
+            tool = tools.get(str(data.get("toolCallId") or ""))
+            if tool is not None:
+                tool.is_error = data.get("success") is False
+                result = data.get("result")
+                tool.output = _text(_dict(result).get("content") if isinstance(result, dict) else result)
+        elif kind == "abort":
+            current.error_code = "aborted"
+            current.error_message = str(data.get("reason") or "aborted")
+            current.is_incomplete = True
+        elif kind == "session.error":
+            current.error_code = str(data.get("errorType") or "error")
+            current.error_message = str(data.get("message") or "")
+
+    if not requests:
+        return None
+    workspace = Path(cwd).name if cwd else path.parent.name
+    return ChatSession(
+        session_id, _title(requests, session_id), created_ms or requests[0].timestamp_ms,
+        requests[0].model_id, requests, "copilot-cli", workspace, str(path),
+        agent_version=version,
+    )
+
+
+def _copilot_cli_apply_usage(
+    request: ChatRequest, entry: dict[str, Any] | None, resolved: str
+) -> None:
+    if resolved:
+        request.resolved_model = resolved
+    if not entry:
+        return
+    request.completion_tokens = _int(entry.get("output_tokens"))
+    request.input_tokens = _int(entry.get("input_tokens"))
+    request.cache_read_tokens = _int(entry.get("cache_read_tokens"))
+    request.cache_write_tokens = _int(entry.get("cache_write_tokens"))
+    request.reasoning_tokens = _int(entry.get("reasoning_tokens"))
+    request.total_elapsed_ms = _duration(entry.get("duration_ms"))
+    request.first_progress_ms = _duration(entry.get("time_to_first_token_ms"))
+    finish = entry.get("finish_reason")
+    if finish:
+        request.stop_reason = str(finish)
+    if not request.model_id:
+        request.model_id = str(entry.get("model") or "")
+
+
+def discover_copilot_cli(root: Path | None = None) -> Iterable[DiscoveredSession]:
+    root = root or Path.home() / ".copilot"
+    state = root / "session-state"
+    if not state.is_dir():
+        return
+    usage = _copilot_cli_usage(root)
+    for directory in sorted(state.iterdir()):
+        path = directory / "events.jsonl"
+        if not path.is_file():
+            continue  # a session directory can hold only rewind snapshots
+        try:
+            session = parse_copilot_cli(path, usage)
+            workspace = session.workspace if session else directory.name
+            yield DiscoveredSession("copilot-cli", workspace, path, session)
+        except OSError as exc:
+            yield DiscoveredSession("copilot-cli", directory.name, path, None, str(exc))
+
+
 def discover(providers: set[str], config_root: Path | None = None) -> list[DiscoveredSession]:
     adapters = {
         "copilot": lambda: discover_copilot(config_root), "agy": discover_agy,
+        "copilot-cli": discover_copilot_cli,
         "claude": discover_claude, "codex": discover_codex, "opencode": discover_opencode,
     }
     return [item for name in PROVIDERS if name in providers for item in adapters[name]()]

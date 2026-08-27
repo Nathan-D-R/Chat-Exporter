@@ -7,17 +7,25 @@ The Python distribution and command are named `chat-exporter`.
 
 ## Supported providers
 
-| Provider | Local store |
-|---|---|
-| GitHub Copilot | VS Code `User/workspaceStorage/*/chatSessions` |
-| AGY / Antigravity CLI | `~/.gemini/antigravity-cli` |
-| Claude Code | `~/.claude/projects` |
-| Codex | `$CODEX_HOME/sessions` or `~/.codex/sessions` |
-| OpenCode | `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode` |
+| Provider | Name | Local store |
+|---|---|---|
+| GitHub Copilot, VS Code extension | `copilot` | VS Code `User/workspaceStorage/*/chatSessions` |
+| GitHub Copilot CLI | `copilot-cli` | `~/.copilot/session-state` |
+| AGY / Antigravity CLI | `agy` | `~/.gemini/antigravity-cli` |
+| Claude Code | `claude` | `~/.claude/projects` |
+| Codex | `codex` | `$CODEX_HOME/sessions` or `~/.codex/sessions` |
+| OpenCode | `opencode` | `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode` |
 
-AGY is decoded directly from its read-only SQLite/protobuf store. OpenCode
-support handles both its legacy JSON layout and current `opencode*.db` store. Provider formats are not
-stable public interchange formats, so test an export after upgrading a client.
+The two Copilot entries are separate products with separate stores: the VS Code
+extension and the standalone CLI. Exporting one does not cover the other, and
+both are included by default.
+
+For the CLI, the event log carries the conversation and its tool calls while a
+sqlite index alongside it carries per-turn tokens and timing; builds older than
+usage tracking still export, without those figures. AGY is decoded directly from
+its read-only SQLite/protobuf store. OpenCode support handles both its legacy
+JSON layout and current `opencode*.db` store. Provider formats are not stable
+public interchange formats, so test an export after upgrading a client.
 
 ## Installation
 
