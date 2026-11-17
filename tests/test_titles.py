@@ -19,9 +19,9 @@ NOTE = "<task-notification><status>completed</status><summary>done</summary></ta
 def _claude(tmp, texts):
     rows = []
     for i, t in enumerate(texts):
-        rows.append({"type": "user", "uuid": f"u{i}", "timestamp": f"2026-01-01T00:0{i}:00Z",
+        rows.append({"type": "user", "uuid": f"u{i}", "timestamp": f"2026-01-01T00:{i:02d}:00Z",
                      "message": {"role": "user", "content": t}})
-        rows.append({"type": "assistant", "timestamp": f"2026-01-01T00:0{i}:01Z", "message": {
+        rows.append({"type": "assistant", "timestamp": f"2026-01-01T00:{i:02d}:01Z", "message": {
             "role": "assistant", "model": "m", "content": [{"type": "text", "text": "ok"}]}})
     path = Path(tmp) / "s.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in rows))
@@ -53,7 +53,7 @@ class TitleTests(unittest.TestCase):
     def test_long_title_trimmed(self):
         title = short_title("word " * 60)
         self.assertTrue(title.endswith("..."))
-        self.assertLessEqual(len(title), 83)
+        self.assertLessEqual(len(title), 63)
 
     def test_plain_prompt_unchanged(self):
         self.assertEqual(human_text("  hello there "), "hello there")
@@ -78,6 +78,39 @@ class TitleTests(unittest.TestCase):
             self.assertEqual(session.title, "Add a unit test")
 
 
+class LeadingOnlyTests(unittest.TestCase):
+    def test_unclosed_tag_inline_is_kept(self):
+        text = "Why does <system-reminder> show up? please explain"
+        self.assertEqual(human_text(text), text)
+        self.assertEqual(short_title(text), text)
+
+    def test_unclosed_tag_at_start_is_dropped(self):
+        self.assertEqual(human_text("<system-reminder>truncated note with no end"), "")
+
+    def test_inline_tag_mentions_preserved(self):
+        text = "see <command-name>a</command-name> then fix the bug"
+        self.assertEqual(human_text(text), text)
+        self.assertEqual(display_prompt(text), text)
+
+    def test_multiple_leading_blocks(self):
+        self.assertEqual(human_text(REMINDER + "\n" + CAVEAT + "\nreal ask"), "real ask")
+
+    def test_command_with_args_is_title_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _claude(tmp, [CAVEAT, CMD.format(n="model", a="fast"), STDOUT])
+            self.assertEqual(session.title, "/model fast")
+
+    def test_notification_first_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _claude(tmp, [NOTE, "actual prompt"])
+            self.assertEqual(session.title, "actual prompt")
+
+    def test_many_turns_parse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _claude(tmp, [f"q{i}" for i in range(12)])
+            self.assertEqual(len(session.requests), 12)
+
+
 class DisplayTests(unittest.TestCase):
     def test_command_is_one_short_line(self):
         self.assertEqual(display_prompt(CMD.format(n="mcp", a="")), "/mcp")
@@ -86,6 +119,15 @@ class DisplayTests(unittest.TestCase):
     def test_continuation_and_stdout_lines(self):
         self.assertEqual(display_prompt(CONTINUED), "[session continued from an earlier conversation]")
         self.assertEqual(display_prompt(STDOUT), "[local command output] Context cleared")
+
+    def test_wrapper_only_turn_has_no_raw_xml(self):
+        for text in (CAVEAT, REMINDER, "<system-reminder>unclosed"):
+            self.assertNotIn("<", display_prompt(text))
+
+    def test_full_detail_keeps_raw_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _claude(tmp, [CMD.format(n="mcp", a=""), "real question"])
+            self.assertIn("<command-name>/mcp</command-name>", render_session(session, detail="full"))
 
     def test_condensed_render_has_no_raw_xml(self):
         with tempfile.TemporaryDirectory() as tmp:

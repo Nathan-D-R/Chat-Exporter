@@ -10,27 +10,26 @@ from __future__ import annotations
 
 import re
 
-TITLE_LIMIT = 80
+TITLE_LIMIT = 60
 
-# Blocks that are never the person's words. Matched with their content.
-_BLOCK_TAGS = (
+# Wrapper blocks agents prepend to a turn. Only a block at the very start of
+# the message is a wrapper; the same tag mentioned mid-sentence is the
+# person's own text and is kept.
+_TAGS = (
     "system-reminder", "local-command-caveat", "local-command-stdout",
     "local-command-stderr", "task-notification", "command-name",
     "command-message", "command-args", "environment_context",
     "user_instructions", "INSTRUCTIONS", "ide_opened_file", "ide_selection",
     "user-prompt-submit-hook",
 )
-_BLOCK_RE = re.compile(
-    r"<(" + "|".join(re.escape(t) for t in _BLOCK_TAGS) + r")(?:\s[^>]*)?>.*?</\1>",
-    re.DOTALL,
-)
-# An opening tag with no close (truncated record): drop from the tag onward.
-_OPEN_RE = re.compile(
-    r"<(?:" + "|".join(re.escape(t) for t in _BLOCK_TAGS) + r")(?:\s[^>]*)?>.*", re.DOTALL
-)
+_ALT = "|".join(re.escape(t) for t in _TAGS)
+_LEAD_BLOCK_RE = re.compile(r"\A\s*<(" + _ALT + r")(?:\s[^>]*)?>.*?</\1>", re.DOTALL)
+# A wrapper tag at the start with no close (truncated record): all wrapper.
+_LEAD_OPEN_RE = re.compile(r"\A\s*<(?:" + _ALT + r")(?:\s[^>]*)?>", re.DOTALL)
 _COMMAND_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
 _COMMAND_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
 _STDOUT_RE = re.compile(r"<local-command-std(?:out|err)>(.*?)</local-command-std(?:out|err)>", re.DOTALL)
+_LEAD_COMMAND_RE = re.compile(r"\s*<command-(?:name|message)>")
 _AGENTS_HEADER_RE = re.compile(r"^#\s*AGENTS\.md instructions for[^\n]*\n?", re.IGNORECASE)
 _CONTINUATION = "This session is being continued from a previous conversation"
 
@@ -41,6 +40,8 @@ def is_continuation(text: str) -> bool:
 
 def slash_command(text: str) -> str:
     """The slash command a wrapper turn ran, with its arguments, or ''."""
+    if not _LEAD_COMMAND_RE.match(text):
+        return ""
     match = _COMMAND_NAME_RE.search(text)
     if not match:
         return ""
@@ -54,9 +55,21 @@ def human_text(text: str) -> str:
     """The prompt text left after removing wrapper blocks; '' if none."""
     if is_continuation(text):
         return ""
-    cleaned = _BLOCK_RE.sub("", text)
-    cleaned = _OPEN_RE.sub("", cleaned)
+    cleaned = text
+    while True:
+        match = _LEAD_BLOCK_RE.match(cleaned)
+        if match:
+            cleaned = cleaned[match.end():]
+            continue
+        if _LEAD_OPEN_RE.match(cleaned):
+            return ""
+        break
     cleaned = _AGENTS_HEADER_RE.sub("", cleaned.strip())
+    while True:
+        match = _LEAD_BLOCK_RE.match(cleaned)
+        if not match:
+            break
+        cleaned = cleaned[match.end():]
     return cleaned.strip()
 
 
@@ -71,9 +84,11 @@ def display_prompt(text: str) -> str:
     human = human_text(stripped)
     if human:
         return human
-    out = _STDOUT_RE.search(stripped)
+    out = _STDOUT_RE.search(stripped) if stripped.startswith("<local-command-std") else None
     if out and out.group(1).strip():
         return "[local command output] " + " ".join(out.group(1).split())[:120]
+    if _LEAD_BLOCK_RE.match(stripped) or _LEAD_OPEN_RE.match(stripped):
+        return "[injected context]"
     return stripped
 
 
