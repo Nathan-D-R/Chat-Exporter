@@ -9,7 +9,12 @@ from typing import Iterable, Literal
 
 from .parser import ChatSession
 from .providers import PROVIDERS, DiscoveredSession, iter_discover
-from .renderer import DEFAULT_MAX_ASSISTANT_CHARS, render_session
+from .renderer import (
+    DEFAULT_MAX_ASSISTANT_CHARS,
+    _collapse_blank_lines,
+    render_session_parts,
+    resolve_detail,
+)
 
 DEFAULT_LIMIT = 10
 MAX_LIMIT = 50
@@ -29,6 +34,12 @@ class SearchHit:
     matched_in: str
     snippet: str
     score: int
+    last_activity_at: str | None = None
+    turns: int = 0
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
 
 
 def _terms(query: str) -> list[str]:
@@ -191,6 +202,8 @@ def search_discovered(
                 matched_in="",
                 snippet="",
                 score=0,
+                last_activity_at=_iso(session.last_activity_at),
+                turns=session.turn_count,
             )
             matching += 1
             keep_result(0, session, hit)
@@ -215,6 +228,8 @@ def search_discovered(
             matched_in=label,
             snippet=_snippet(text, terms),
             score=score,
+            last_activity_at=_iso(session.last_activity_at),
+            turns=session.turn_count,
         )
         matching += 1
         keep_result(score, session, hit)
@@ -260,10 +275,79 @@ def _session_metadata(session: ChatSession) -> dict[str, object]:
         "session_id": session.session_id,
         "title": session.title,
         "created_at": session.created_at.isoformat(),
-        "turns": len(session.user_requests),
+        "turns": session.turn_count,
+        "last_activity_at": _iso(session.last_activity_at),
         "models": dict(session.models_used),
         "edited_files": session.edited_files,
     }
+
+
+_NOTICE_RESERVE = 240
+
+
+def _page_blocks(blocks: list[str], budget: int, from_end: bool) -> list[tuple[int, int]]:
+    """Split block indexes into pages of at most `budget` characters, whole
+    blocks only (a block longer than the budget gets a page to itself). Pages
+    are returned in reading order: from the end when `from_end`, else from
+    the start. Each page is a (first, stop) index range."""
+    order = range(len(blocks) - 1, -1, -1) if from_end else range(len(blocks))
+    pages: list[tuple[int, int]] = []
+    used = 0
+    first = None
+    last = None
+    for i in order:
+        size = len(blocks[i]) + 1
+        if first is not None and used + size > budget:
+            pages.append((min(first, last), max(first, last) + 1))
+            first, used = None, 0
+        if first is None:
+            first = i
+        last = i
+        used += size
+    if first is not None:
+        pages.append((min(first, last), max(first, last) + 1))
+    return pages
+
+
+def _split_block(text: str, size: int) -> list[str]:
+    """Cut one oversized turn into chunks of at most `size` characters at line
+    boundaries (a longer line is cut), with a marker on each side that continues."""
+    pieces: list[str] = []
+    current: list[str] = []
+    used = 0
+    for line in text.split("\n"):
+        while len(line) > size:
+            if current:
+                pieces.append("\n".join(current))
+                current, used = [], 0
+            pieces.append(line[:size])
+            line = line[size:]
+        if current and used + len(line) + 1 > size:
+            pieces.append("\n".join(current))
+            current, used = [], 0
+        current.append(line)
+        used += len(line) + 1
+    if current:
+        pieces.append("\n".join(current))
+    last = len(pieces) - 1
+    return [
+        ("[start of turn truncated; see the previous part]\n\n" if i else "")
+        + piece
+        + ("\n\n[turn continues in the next part]" if i < last else "")
+        for i, piece in enumerate(pieces)
+    ]
+
+
+def _page_notice(before: int, after: int, page: int, from_end: bool) -> tuple[str, str]:
+    """Markers for the turns left out before and after a page."""
+    previous = page + 1 if from_end else page - 1
+    following = page - 1 if from_end else page + 1
+    top = bottom = ""
+    if before:
+        top = f"[{before} earlier turns omitted; page={previous} for the previous part]"
+    if after:
+        bottom = f"[{after} later turns omitted; page={following} for the next part]"
+    return top, bottom
 
 
 def read_session(
@@ -274,18 +358,31 @@ def read_session(
     include_tools: bool = True,
     max_tool_output: int = 2_000,
     max_chars: int = DEFAULT_MAX_CHARS,
-    condensed: bool = False,
+    condensed: bool | None = None,
     max_assistant_chars: int = DEFAULT_MAX_ASSISTANT_CHARS,
+    detail: str | None = None,
+    from_end: bool = True,
+    page: int = 0,
 ) -> dict[str, object]:
     """Find one session and render a bounded, readable transcript.
 
-    Condensed mode is intended for cross-session review: it includes user
-    prompts and assistant prose only, with no tool calls or operational
-    metadata.
+    detail is "condensed" (default), "standard" or "full". The legacy
+    `condensed` flag applies only when detail is not given: True means
+    "condensed", False means "full". When the transcript is longer than
+    max_chars it is cut between turns: from_end=True keeps the last turns
+    (page 0), and page=1, 2, ... read the parts before it; from_end=False
+    keeps the first turns and pages forward. A single turn longer than a page
+    is split at line boundaries across pages, each part marked, so page= reaches
+    all of it (from_end=True shows the end of that turn on page 0). The result
+    reports truncated, page and pages. Turn numbers mean the same at every
+    detail level.
     """
     _validate_providers([provider])
     if not session_id.strip():
         raise ValueError("session_id must not be empty")
+    if page < 0:
+        raise ValueError("page must be zero or greater")
+    level = resolve_detail(detail, condensed)
     bounded_chars = _bounded(max_chars, DEFAULT_MAX_CHARS, MAX_CHARS)
     for item in iter_discover({provider}):
         session = item.session
@@ -296,22 +393,52 @@ def read_session(
             continue
         if workspace and workspace.casefold() not in session.workspace.casefold():
             continue
-        content = render_session(
+        header, blocks, footer = render_session_parts(
             session,
             include_tools=include_tools,
             include_thinking=False,
             include_metrics=True,
             include_files=True,
             max_tool_output=max(0, max_tool_output),
-            condensed=condensed,
             max_assistant_chars=min(max(0, max_assistant_chars), MAX_ASSISTANT_CHARS),
+            detail=level,
+            group_notifications=True,
         )
-        truncated = len(content) > bounded_chars
-        if truncated:
-            content = content[:bounded_chars].rstrip() + "\n\n... [transcript truncated]\n"
+        if footer and blocks:
+            blocks[-1] = blocks[-1] + "\n" + footer
+        elif footer:
+            header = header + "\n" + footer
+        budget = max(bounded_chars - len(header) - _NOTICE_RESERVE, 200)
+        # A turn longer than a page is split so every part is reachable.
+        owner: list[int] = []
+        pieces: list[str] = []
+        for turn, block in enumerate(blocks):
+            chunks = _split_block(block, max(budget - 100, 100)) if len(block) + 1 > budget else [block]
+            pieces += chunks
+            owner += [turn] * len(chunks)
+        blocks = pieces
+        pages = _page_blocks(blocks, budget, from_end)
+        total = max(len(pages), 1)
+        if page >= total:
+            raise ValueError(f"page {page} is out of range; this transcript has {total} page(s)")
+        if pages:
+            first, stop = pages[page]
+            chosen = blocks[first:stop]
+            shown = set(owner[first:stop])
+            before = len(set(owner[:first]) - shown)
+            after = len(set(owner[stop:]) - shown)
+            top, bottom = _page_notice(before, after, page, from_end)
+            parts = [header] + ([top] if top else []) + chosen + ([bottom] if bottom else [])
+        else:
+            parts = [header]
+        content = _collapse_blank_lines("\n".join(parts)).rstrip() + "\n"
         return {
             "session": _session_metadata(session),
             "content": content,
-            "truncated": truncated,
+            "truncated": total > 1,
+            "page": page,
+            "pages": total,
+            "detail": level,
+            "from_end": from_end,
         }
     raise ValueError(f"Session not found: {provider}/{session_id}")

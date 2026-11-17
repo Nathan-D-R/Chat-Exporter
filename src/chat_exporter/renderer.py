@@ -80,6 +80,18 @@ def _truncate(text: str, limit: int) -> str:
     return f"{kept}\n... [{len(text) - len(kept):,} more characters truncated]"
 
 
+def _bound_middle(compact: str, limit: int) -> str:
+    """Keep the start and end of `compact` when it exceeds `limit`."""
+    if limit <= 0 or len(compact) <= limit:
+        return compact
+    marker = " [assistant response condensed] "
+    if limit <= len(marker):
+        return marker[:limit]
+    head = max(1, (limit - len(marker)) // 2)
+    tail = limit - len(marker) - head
+    return compact[:head].rstrip() + marker + compact[-tail:].lstrip()
+
+
 def _condense_assistant_text(text: str, limit: int) -> str:
     """Keep readable assistant prose while dropping embedded detail blocks."""
     text = _DETAILS_RE.sub("", text)
@@ -92,14 +104,30 @@ def _condense_assistant_text(text: str, limit: int) -> str:
         if not in_fence and line.strip():
             lines.append(line.strip())
     compact = _MULTI_SPACE_RE.sub(" ", " ".join(lines)).strip()
-    if limit <= 0 or len(compact) <= limit:
-        return compact
-    marker = " [assistant response condensed] "
-    if limit <= len(marker):
-        return marker[:limit]
-    head = max(1, (limit - len(marker)) // 2)
-    tail = limit - len(marker) - head
-    return compact[:head].rstrip() + marker + compact[-tail:].lstrip()
+    return _bound_middle(compact, limit)
+
+
+def _prose_paragraphs(text: str) -> list[str]:
+    """Assistant prose as paragraphs (blank-line separated), without detail
+    blocks and code fences; each paragraph is one whitespace-collapsed line."""
+    text = _DETAILS_RE.sub("", text)
+    paragraphs: list[str] = []
+    current: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if line.strip():
+            current.append(line.strip())
+        elif current:
+            paragraphs.append(_MULTI_SPACE_RE.sub(" ", " ".join(current)).strip())
+            current = []
+    if current:
+        paragraphs.append(_MULTI_SPACE_RE.sub(" ", " ".join(current)).strip())
+    return paragraphs
 
 
 def _collapse_blank_lines(text: str) -> str:
@@ -379,16 +407,26 @@ def _render_request(
     include_context: bool,
     max_output: int,
     include_args: bool,
+    turn_header: bool = True,
+    notification_lines: bool = False,
 ) -> str:
-    lines: list[str] = ["---", ""]
+    """Render one request. A background-task notification is shown as its
+    one-line form, never as a User prompt; with turn_header=False it continues
+    the turn before it."""
+    lines: list[str] = ["---", ""] if turn_header else []
 
-    # User turn
     ts = req.timestamp.astimezone().strftime("%H:%M:%S")
-    lines.append(f"### Turn {index} \u00b7 {ts}")
-    lines.append("")
-    lines.append("**User**")
-    lines.append("")
-    lines.append(req.user_text.strip())
+    if turn_header:
+        lines.append(f"### Turn {index} \u00b7 {ts}")
+        lines.append("")
+    if req.is_notification and notification_lines:
+        lines.append(f"**Background task** ({ts})")
+        lines.append("")
+        lines.append(_notification_line(req))
+    else:
+        lines.append("**User**")
+        lines.append("")
+        lines.append(req.user_text.strip())
     lines.append("")
 
     if include_context and req.context_files:
@@ -435,28 +473,165 @@ def _render_request(
     return "\n".join(lines)
 
 
-def _render_condensed_request(
-    req: ChatRequest,
-    index: int,
-    max_assistant_chars: int,
-) -> str:
-    lines: list[str] = ["---", "", f"### Turn {index}", "", "**User**", ""]
-    lines.append(req.user_text.strip())
-    lines.append("")
+# ---------------------------------------------------------------------------
+# Condensed and standard detail levels
+# ---------------------------------------------------------------------------
 
-    assistant = _condense_assistant_text(req.assistant_text, max_assistant_chars)
-    if assistant:
-        lines += ["**Assistant**", "", assistant, ""]
+DETAIL_LEVELS = ("condensed", "standard", "full")
+MIN_REPEAT_CHARS = 40
+_SUBAGENT_TOOLS = {"agent", "task"}
 
-    if req.error_code or req.is_incomplete:
-        detail = _MULTI_SPACE_RE.sub(
-            " ", (req.error_message or req.error_code or "response incomplete").replace("\n", " ")
-        ).strip()
-        label = "Interrupted" if req.error_code == "canceled" else "Error"
-        lines.append(f"> **{label}:** {detail}")
-        lines.append("")
 
-    return "\n".join(lines)
+def _clip(text: str, limit: int) -> str:
+    text = _MULTI_SPACE_RE.sub(" ", " ".join(text.split()))
+    return text if len(text) <= limit else text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _note_field(text: str, tag: str) -> str:
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+    return " ".join(match.group(1).split()) if match else ""
+
+
+def _notification_line(req: ChatRequest) -> str:
+    """One line for a Claude Code background-task notification."""
+    status = _note_field(req.user_text, "status") or "finished"
+    summary = _note_field(req.user_text, "summary") or "(no summary)"
+    result = _note_field(req.user_text, "result")
+    line = f"- [background task {status}] {_clip(summary, 160)}"
+    return line + (f" -- {_clip(result, 200)}" if result else "")
+
+
+def _is_subagent(tool: ToolCall) -> bool:
+    return tool.subagent is not None or tool.label.casefold() in _SUBAGENT_TOOLS
+
+
+def _arg_value(tool: ToolCall, *keys: str) -> str:
+    try:
+        data = json.loads(tool.arguments) if tool.arguments else {}
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _tool_state(tool: ToolCall) -> str:
+    if tool.is_error or tool.exit_code not in (None, 0):
+        return "error"
+    return "ok" if tool.is_complete else "incomplete"
+
+
+def _subagent_line(tool: ToolCall) -> str:
+    sub = tool.subagent
+    description = (
+        (sub.description if sub else "")
+        or _arg_value(tool, "description", "name", "agent_type", "subagent_type")
+        or tool.summary
+        or tool.label
+    )
+    result = (sub.result if sub and sub.result else "") or tool.output
+    line = f"- [subagent {_tool_state(tool)}] {_clip(description, 160)}"
+    return line + (f" -- {_clip(result, 200)}" if result.strip() else "")
+
+
+def _tool_line(tool: ToolCall) -> str:
+    preview = tool.command or tool.summary or tool.arguments
+    line = f"- tool {tool.label}"
+    if preview.strip():
+        line += f": {_clip(preview, 120)}"
+    return f"{line} [{_tool_state(tool)}]"
+
+
+def _group_turns(requests: list[ChatRequest]) -> list[list[ChatRequest]]:
+    """Group requests into turns; a notification joins the turn before it."""
+    groups: list[list[ChatRequest]] = []
+    for req in requests:
+        if req.is_notification and groups:
+            groups[-1].append(req)
+        else:
+            groups.append([req])
+    return groups
+
+
+def _error_line(req: ChatRequest) -> str:
+    detail = _MULTI_SPACE_RE.sub(
+        " ", (req.error_message or req.error_code or "response incomplete").replace("\n", " ")
+    ).strip()
+    label = "Interrupted" if req.error_code == "canceled" else "Error"
+    return f"> **{label}:** {detail}"
+
+
+def _summary_blocks(
+    requests: list[ChatRequest], detail: str, max_assistant_chars: int
+) -> list[str]:
+    """One Markdown block per turn for the condensed and standard levels."""
+    seen: dict[str, int] = {}
+    blocks: list[str] = []
+    for number, group in enumerate(_group_turns(requests), start=1):
+        # (kind, text, new): kind is prose, line or error; for prose, `new`
+        # lists (key, paragraph) pairs that are first copies.
+        segments: list[tuple[str, str, list[tuple[str, str]]]] = []
+        for req in group:
+            if req.is_notification:
+                segments.append(("line", _notification_line(req), []))
+            for part in req.response_parts:
+                if part.kind == "text" and part.text.strip():
+                    prose: list[str] = []
+                    new: list[tuple[str, str]] = []
+                    for paragraph in _prose_paragraphs(part.text):
+                        key = paragraph.casefold()
+                        if len(key) >= MIN_REPEAT_CHARS and key in seen:
+                            prose.append(f"[repeated from turn {seen[key]}]")
+                        else:
+                            if len(key) >= MIN_REPEAT_CHARS:
+                                new.append((key, paragraph))
+                            prose.append(paragraph)
+                    if prose:
+                        segments.append(("prose", "\n\n".join(prose), new))
+                elif part.kind == "tool_call" and part.tool:
+                    if _is_subagent(part.tool):
+                        segments.append(("line", _subagent_line(part.tool), []))
+                    elif detail == "standard":
+                        segments.append(("line", _tool_line(part.tool), []))
+            if req.error_code or req.is_incomplete:
+                segments.append(("error", _error_line(req), []))
+
+        # The prose limit applies per turn, as in the old condensed view.
+        prose_count = sum(k == "prose" for k, _, _ in segments)
+        if max_assistant_chars > 0 and sum(len(t) for k, t, _ in segments if k == "prose") > max_assistant_chars:
+            share = max(1, max_assistant_chars // max(1, prose_count))
+            segments = [
+                (k, _bound_middle(t, share), n) if k == "prose" else (k, t, n)
+                for k, t, n in segments
+            ]
+        # Only a paragraph that is shown whole can be pointed to later.
+        for kind, text, new in segments:
+            if kind == "prose":
+                for key, paragraph in new:
+                    if paragraph in text:
+                        seen.setdefault(key, number)
+
+        if group[0].is_notification:
+            lead = ["**Background task**", "", _notification_line(group[0]), ""]
+            segments = [seg for seg in segments if not (seg[0] == "line" and seg[1] == _notification_line(group[0]))]
+        else:
+            lead = ["**User**", "", group[0].user_text.strip(), ""]
+        lines = ["---", "", f"### Turn {number}", ""] + lead
+        body: list[str] = []
+        previous = ""
+        for kind, text, _ in segments:
+            if body:
+                body.append("\n" if kind == "line" and previous == "line" else "\n\n")
+            body.append(text)
+            previous = kind
+        if body:
+            lines += ["**Assistant**", "", "".join(body), ""]
+        blocks.append("\n".join(lines))
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -517,11 +692,14 @@ def _render_header(session: ChatSession, include_metrics: bool) -> list[str]:
 
 
 def _render_condensed_header(session: ChatSession) -> list[str]:
+    stamp = session.last_activity_at
+    last = stamp.astimezone().strftime("%Y-%m-%d %H:%M %Z") if stamp else "unknown"
     return [
         f"# {session.title}",
         "",
-        f"**Session:** `{session.session_id}` · **Provider:** `{session.provider}` · "
+        f"**Session:** `{session.session_id}` \u00b7 **Provider:** `{session.provider}` \u00b7 "
         f"**Workspace:** `{session.workspace}`",
+        f"**Turns:** {session.turn_count} \u00b7 **Last activity:** {last}",
         "",
     ]
 
@@ -529,6 +707,91 @@ def _render_condensed_header(session: ChatSession) -> list[str]:
 # ---------------------------------------------------------------------------
 # Public render functions
 # ---------------------------------------------------------------------------
+
+def resolve_detail(
+    detail: str | None = None, condensed: bool | None = None, default: str = "condensed"
+) -> str:
+    """Pick the detail level. An explicit `detail` wins; otherwise the legacy
+    `condensed` flag maps True to "condensed" and False to "full"; with neither,
+    the level is `default`."""
+    if detail is not None:
+        if detail not in DETAIL_LEVELS:
+            raise ValueError(f"detail must be one of {', '.join(DETAIL_LEVELS)}")
+        return detail
+    if condensed is None:
+        return default
+    return "condensed" if condensed else "full"
+
+
+def render_session_parts(
+    session: ChatSession,
+    include_tools: bool = True,
+    include_thinking: bool = False,
+    include_metrics: bool = True,
+    include_files: bool = True,
+    include_context: bool = False,
+    include_tool_args: bool = False,
+    max_tool_output: int = DEFAULT_MAX_TOOL_OUTPUT,
+    condensed: bool | None = None,
+    max_assistant_chars: int = DEFAULT_MAX_ASSISTANT_CHARS,
+    detail: str | None = None,
+    group_notifications: bool = False,
+) -> tuple[str, list[str], str]:
+    """Render a session as (header, one block per turn, footer).
+
+    Joining the three with newlines gives the whole transcript; callers that
+    page a long transcript cut between blocks so no turn is split.
+    """
+    level = resolve_detail(detail, condensed, default="full")
+    if level == "full":
+        header = "\n".join(_render_header(session, include_metrics))
+    else:
+        header = "\n".join(_render_condensed_header(session))
+
+    user_reqs = session.user_requests
+    if not user_reqs:
+        return header, [], "_No messages in this session._"
+
+    if level != "full":
+        return header, _summary_blocks(user_reqs, level, max(0, max_assistant_chars)), ""
+
+    def render(req: ChatRequest, index: int, turn_header: bool = True) -> str:
+        return _render_request(
+            req,
+            index,
+            include_tools=include_tools,
+            include_thinking=include_thinking,
+            include_metrics=include_metrics,
+            include_files=include_files,
+            include_context=include_context,
+            max_output=max_tool_output,
+            include_args=include_tool_args,
+            turn_header=turn_header,
+            notification_lines=group_notifications,
+        )
+
+    if group_notifications:
+        # Same turn numbering as the condensed levels: a notification joins the
+        # turn before it.
+        blocks = [
+            "\n".join(
+                render(req, number, turn_header=position == 0)
+                for position, req in enumerate(group)
+            )
+            for number, group in enumerate(_group_turns(user_reqs), start=1)
+        ]
+    else:
+        blocks = [render(req, idx) for idx, req in enumerate(user_reqs, start=1)]
+    footer = ""
+    edited = session.edited_files if include_files else []
+    if edited:
+        footer = "\n".join(
+            ["---", "", f"## Files changed ({len(edited)})", ""]
+            + [f"- `{_short_path(p)}`" for p in edited]
+            + [""]
+        )
+    return header, blocks, footer
+
 
 def render_session(
     session: ChatSession,
@@ -539,60 +802,29 @@ def render_session(
     include_context: bool = False,
     include_tool_args: bool = False,
     max_tool_output: int = DEFAULT_MAX_TOOL_OUTPUT,
-    condensed: bool = False,
+    condensed: bool | None = None,
     max_assistant_chars: int = DEFAULT_MAX_ASSISTANT_CHARS,
+    detail: str | None = None,
+    group_notifications: bool = False,
 ) -> str:
     """Render a ChatSession as Markdown.
 
-    Condensed mode keeps only user prompts and assistant prose, removes tool
-    calls, metrics, context, and file summaries, and bounds each assistant
-    response.
+    Detail levels: "condensed" keeps user prompts and assistant prose plus one
+    line per subagent or background-task result; "standard" adds one line per
+    tool call; "full" renders tool calls with output, metrics and file lists.
+    The legacy `condensed` flag maps True to "condensed" and False to "full".
+    Assistant prose repeated from an earlier paragraph is replaced by a
+    pointer in condensed and standard output. With group_notifications, "full"
+    numbers turns the way the other levels do (notifications join the turn before
+    them and show as a labeled line); the export CLI leaves it off.
     """
-    if condensed:
-        lines = _render_condensed_header(session)
-    else:
-        lines = _render_header(session, include_metrics)
-
-    user_reqs = session.user_requests
-    if not user_reqs:
-        lines.append("_No messages in this session._")
-        return "\n".join(lines)
-
-    for idx, req in enumerate(user_reqs, start=1):
-        if condensed:
-            lines.append(
-                _render_condensed_request(
-                    req,
-                    idx,
-                    max_assistant_chars=max(0, max_assistant_chars),
-                )
-            )
-        else:
-            lines.append(
-                _render_request(
-                    req,
-                    idx,
-                    include_tools=include_tools,
-                    include_thinking=include_thinking,
-                    include_metrics=include_metrics,
-                    include_files=include_files,
-                    include_context=include_context,
-                    max_output=max_tool_output,
-                    include_args=include_tool_args,
-                )
-            )
-
-    if include_files and not condensed:
-        edited = session.edited_files
-        if edited:
-            lines.append("---")
-            lines.append("")
-            lines.append(f"## Files changed ({len(edited)})")
-            lines.append("")
-            lines.extend(f"- `{_short_path(p)}`" for p in edited)
-            lines.append("")
-
-    return _collapse_blank_lines("\n".join(lines)).rstrip() + "\n"
+    header, blocks, footer = render_session_parts(
+        session, include_tools, include_thinking, include_metrics, include_files,
+        include_context, include_tool_args, max_tool_output, condensed,
+        max_assistant_chars, detail, group_notifications,
+    )
+    parts = [header, *blocks] + ([footer] if footer else [])
+    return _collapse_blank_lines("\n".join(parts)).rstrip() + "\n"
 
 
 def render_session_json(

@@ -119,6 +119,13 @@ class ToolCall:
     todos: list[TodoItem] = field(default_factory=list)
     subagent: SubagentCall | None = None
     result_files: list[str] = field(default_factory=list)
+    # failure detail (copilot-cli and copilot-desktop tool.execution_complete)
+    error_code: str = ""
+    error_message: str = ""
+    failure_category: str = ""
+    failure_stage: str = ""
+    context_tokens: int | None = None
+    context_limit: int | None = None
 
     @property
     def label(self) -> str:
@@ -148,6 +155,9 @@ class ChatRequest:
     resolved_model: str = ""
     user_text: str = ""
     is_system_initiated: bool = False
+    # A harness message (for Claude Code, a background-task notification) that
+    # arrives as a user record but is not something the person typed.
+    is_notification: bool = False
     system_label: str = ""
     response_parts: list[ResponsePart] = field(default_factory=list)
     # metrics
@@ -223,6 +233,22 @@ class ChatSession:
     def user_requests(self) -> list[ChatRequest]:
         """Only human-initiated requests with non-empty messages."""
         return [r for r in self.requests if not r.is_system_initiated and r.user_text]
+
+    @property
+    def turn_count(self) -> int:
+        """Human turns: user requests that are not harness notifications."""
+        return sum(1 for r in self.user_requests if not r.is_notification)
+
+    @property
+    def last_activity_ms(self) -> int | None:
+        """Start of the last request plus its duration; None if nothing is timestamped."""
+        ends = [r.timestamp_ms + (r.duration_ms or 0) for r in self.requests if r.timestamp_ms]
+        return max(ends, default=None)
+
+    @property
+    def last_activity_at(self) -> datetime | None:
+        ms = self.last_activity_ms
+        return _epoch_ms(ms) if ms else None
 
     @property
     def models_used(self) -> list[tuple[str, int]]:

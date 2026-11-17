@@ -15,7 +15,7 @@ from typing import Any, Iterable
 from .discovery import find_workspace_storage_dirs, get_workspace_name, list_chat_session_files
 from .parser import ChatRequest, ChatSession, ResponsePart, SubagentCall, ToolCall, parse_session
 
-PROVIDERS = ("copilot", "copilot-cli", "agy", "claude", "codex", "opencode")
+PROVIDERS = ("copilot", "copilot-cli", "copilot-desktop", "agy", "claude", "codex", "opencode")
 
 
 @dataclass
@@ -268,7 +268,6 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
     Those files live under the project directory of the subagent's own cwd, not
     next to the transcript that launched it, so the caller builds the map.
     """
-    first: dict[str, Any] | None = None
     if agent_files is None:
         agent_files = _claude_agent_files(path.parent)
 
@@ -278,6 +277,7 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
     # message id -> last output_tokens seen, so repeated records are not double counted
     usage_seen: dict[str, int] = {}
     model = ""
+    first: dict[str, Any] | None = None
     for item in _jsonl_records(path):
         if (item.get("type") not in ("user", "assistant") or item.get("isSidechain")
                 or item.get("isMeta")):
@@ -306,6 +306,7 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
                 current = ChatRequest(
                     request_id=item.get("uuid", ""), timestamp_ms=_ms(item.get("timestamp")),
                     user_text=text,
+                    is_notification=text.lstrip().startswith("<task-notification>"),
                 )
                 requests.append(current)
         elif role == "assistant" and current:
@@ -773,7 +774,24 @@ def discover_opencode(root: Path | None = None) -> Iterable[DiscoveredSession]:
 # one event log per session in session-state/<id>/events.jsonl, plus a sqlite
 # index whose assistant_usage_events table holds the per-turn token and timing
 # figures the event log does not carry.
+#
+# Copilot Desktop writes its chats to the same session-state/<id>/events.jsonl
+# layout. Its registry is ~/.copilot/data.db, whose sessions table holds the
+# IDs and titles of the desktop chats. Those folders are reported as
+# `copilot-desktop`, not `copilot-cli`.
 # ---------------------------------------------------------------------------
+
+def _copilot_desktop_index(root: Path) -> dict[str, str | None]:
+    """Desktop session IDs mapped to their titles, read from data.db."""
+    store = root / "data.db"
+    if not store.is_file():
+        return {}
+    try:
+        with closing(sqlite3.connect(f"file:{store}?mode=ro", uri=True)) as db:
+            return {str(row[0]): row[1] for row in db.execute("SELECT id, title FROM sessions")}
+    except sqlite3.Error:
+        return {}
+
 
 def _copilot_cli_usage(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
     """Per-turn usage from the CLI's sqlite index, keyed by session and turn."""
@@ -838,8 +856,44 @@ def _copilot_cli_tool(data: dict[str, Any]) -> ToolCall:
     return tool
 
 
-def parse_copilot_cli(path: Path, usage: dict[tuple[str, int], dict[str, Any]]) -> ChatSession | None:
-    """Parse one session-state/<id>/events.jsonl event log."""
+def _whole(value: Any) -> int | None:
+    """A count that the log may write as an int or a float (52102.0)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return int(value)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _copilot_cli_apply_failure(tool: ToolCall, data: dict[str, Any]) -> None:
+    """Copy the error, failure telemetry and context size of a completed call."""
+    error = data.get("error")
+    if isinstance(error, dict):
+        tool.error_message = str(error.get("message") or "")
+        tool.error_code = str(error.get("code") or "")
+    elif isinstance(error, str):
+        tool.error_message = error
+    telemetry = _dict(data.get("toolTelemetry"))
+    props = _dict(telemetry.get("properties"))
+    metrics = _dict(telemetry.get("metrics"))
+    tool.failure_category = str(props.get("failure_category") or "")
+    tool.failure_stage = str(props.get("failure_stage") or "")
+    tool.context_tokens = _whole(metrics.get("context_current_tokens"))
+    tool.context_limit = _whole(metrics.get("context_token_limit"))
+
+
+def parse_copilot_cli(
+    path: Path,
+    usage: dict[tuple[str, int], dict[str, Any]],
+    provider: str = "copilot-cli",
+    title: str | None = None,
+) -> ChatSession | None:
+    """Parse one session-state/<id>/events.jsonl event log.
+
+    `title` is the registry title when the caller has one; otherwise the title
+    is derived from the first user message.
+    """
     requests: list[ChatRequest] = []
     current: ChatRequest | None = None
     tools: dict[str, ToolCall] = {}
@@ -906,6 +960,7 @@ def parse_copilot_cli(path: Path, usage: dict[tuple[str, int], dict[str, Any]]) 
                 tool.is_error = data.get("success") is False
                 result = data.get("result")
                 tool.output = _text(_dict(result).get("content") if isinstance(result, dict) else result)
+                _copilot_cli_apply_failure(tool, data)
         elif kind == "abort":
             current.error_code = "aborted"
             current.error_message = str(data.get("reason") or "aborted")
@@ -918,8 +973,8 @@ def parse_copilot_cli(path: Path, usage: dict[tuple[str, int], dict[str, Any]]) 
         return None
     workspace = Path(cwd).name if cwd else path.parent.name
     return ChatSession(
-        session_id, _title(requests, session_id), created_ms or requests[0].timestamp_ms,
-        requests[0].model_id, requests, "copilot-cli", workspace, str(path),
+        session_id, title or _title(requests, session_id), created_ms or requests[0].timestamp_ms,
+        requests[0].model_id, requests, provider, workspace, str(path),
         agent_version=version,
     )
 
@@ -950,11 +1005,12 @@ def discover_copilot_cli(root: Path | None = None) -> Iterable[DiscoveredSession
     state = root / "session-state"
     if not state.is_dir():
         return
+    desktop = _copilot_desktop_index(root)
     usage = _copilot_cli_usage(root)
     for directory in sorted(state.iterdir()):
         path = directory / "events.jsonl"
-        if not path.is_file():
-            continue  # a session directory can hold only rewind snapshots
+        if not path.is_file() or directory.name in desktop:
+            continue  # rewind-only directories, and desktop chats (see discover_copilot_desktop)
         try:
             session = parse_copilot_cli(path, usage)
             workspace = session.workspace if session else directory.name
@@ -963,12 +1019,31 @@ def discover_copilot_cli(root: Path | None = None) -> Iterable[DiscoveredSession
             yield DiscoveredSession("copilot-cli", directory.name, path, None, str(exc))
 
 
+def discover_copilot_desktop(root: Path | None = None) -> Iterable[DiscoveredSession]:
+    root = root or Path.home() / ".copilot"
+    state = root / "session-state"
+    if not state.is_dir():
+        return
+    usage = _copilot_cli_usage(root)
+    for session_id, title in sorted(_copilot_desktop_index(root).items()):
+        directory = state / session_id
+        path = directory / "events.jsonl"
+        if not path.is_file():
+            continue
+        try:
+            session = parse_copilot_cli(path, usage, provider="copilot-desktop", title=title)
+            workspace = session.workspace if session else directory.name
+            yield DiscoveredSession("copilot-desktop", workspace, path, session)
+        except OSError as exc:
+            yield DiscoveredSession("copilot-desktop", directory.name, path, None, str(exc))
+
+
 def iter_discover(
     providers: set[str],
     config_root: Path | None = None,
     roots: dict[str, Path] | None = None,
 ) -> Iterable[DiscoveredSession]:
-    """Lazily discover sessions for the named providers.
+    """Lazily discover sessions for the named providers, parsing one at a time.
 
     `roots` overrides where a provider's store is read from, which is what
     makes a store outside the current home reachable: one copied out of a
@@ -977,7 +1052,7 @@ def iter_discover(
     roots = roots or {}
     adapters = {
         "copilot": discover_copilot, "agy": discover_agy,
-        "copilot-cli": discover_copilot_cli,
+        "copilot-cli": discover_copilot_cli, "copilot-desktop": discover_copilot_desktop,
         "claude": discover_claude, "codex": discover_codex, "opencode": discover_opencode,
     }
     # --config-root predates --root and stays an alias for the extension's store.

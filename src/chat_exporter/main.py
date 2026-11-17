@@ -14,6 +14,7 @@ from .renderer import (
     render_session_json,
     safe_filename,
 )
+from .tables import TableRows, write_parquet
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -39,8 +40,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Omit the per-turn and per-session files-changed summaries")
     parser.add_argument("--include-context", action="store_true",
                         help="List the context files attached to each turn")
-    parser.add_argument("--format", choices=("md", "json"), default="md",
-                        help="Output format (default: md). json emits the full structured record.")
+    parser.add_argument("--format", choices=("md", "json", "parquet"), default="md",
+                        help="Output format (default: md). json emits the full structured record;"
+                             " parquet writes sessions, turns, tool_calls, events and permissions tables.")
     parser.add_argument("--include-thinking", action="store_true",
                         help="Include model thinking/reasoning blocks in output")
     parser.add_argument("--min-messages", type=int, default=1, metavar="N")
@@ -163,6 +165,9 @@ def _run_list(items: list[DiscoveredSession]) -> None:
 def _run_export(items: list[DiscoveredSession], args: argparse.Namespace) -> None:
     output_root = Path(args.output_dir)
     options = RenderOptions.from_args(args)
+    if options.fmt == "parquet":
+        _run_export_parquet(items, args, options, output_root)
+        return
     exported = skipped = 0
     for item in items:
         session = item.session
@@ -178,6 +183,34 @@ def _run_export(items: list[DiscoveredSession], args: argparse.Namespace) -> Non
         out_path.write_text(options.render(session), encoding="utf-8")
         print(f"  Exported: {out_path.relative_to(output_root)}")
         exported += 1
+    print(f"\nDone. {exported} session(s) exported, {skipped} skipped.")
+
+
+def _run_export_parquet(
+    items: list[DiscoveredSession],
+    args: argparse.Namespace,
+    options: RenderOptions,
+    output_root: Path,
+) -> None:
+    rows = TableRows(
+        include_thinking=options.include_thinking,
+        include_tools=options.include_tools,
+        max_tool_output=options.max_tool_output,
+    )
+    exported = skipped = 0
+    for item in items:
+        session = item.session
+        if session is None or len(session.user_requests) < args.min_messages:
+            skipped += 1
+            continue
+        rows.add_session(session)
+        exported += 1
+    write_parquet(rows, output_root)
+    print("Wrote sessions, turns, tool_calls, events and permissions Parquet files "
+          f"to {output_root}")
+    print(f"  sessions: {len(rows.sessions)}, turns: {len(rows.turns)}, "
+          f"tool_calls: {len(rows.tool_calls)}, events: {len(rows.events)}, "
+          f"permissions: {len(rows.permissions)}")
     print(f"\nDone. {exported} session(s) exported, {skipped} skipped.")
 
 

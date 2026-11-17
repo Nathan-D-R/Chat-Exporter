@@ -8,6 +8,7 @@ from chat_exporter.parser import parse_session
 from chat_exporter.providers import (
     discover,
     discover_copilot_cli,
+    discover_copilot_desktop,
     discover_opencode,
     parse_agy,
     parse_claude,
@@ -408,6 +409,44 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual((view.output, view.is_error), ("denied", True))
             self.assertIn('"path": "/work/demo"'.replace("/work/demo", "/var/log"), view.arguments)
 
+    def test_copilot_cli_failed_call_detail(self):
+        """A failed call keeps its error, failure telemetry and context size."""
+        def complete(call_id, error):
+            return {"type": "tool.execution_complete", "data": {
+                "toolCallId": call_id, "success": False, "error": error,
+                "toolTelemetry": {
+                    "properties": {"failure_category": "server_error",
+                                   "failure_stage": "invoke"},
+                    "metrics": {"context_current_tokens": 52102.0,
+                                "context_token_limit": 272000.0}}}}
+        start = {"type": "tool.execution_start", "data": {
+            "toolName": "demo-server-query", "arguments": {"q": "x"}}}
+        events = [
+            {"type": "session.start", "timestamp": "2026-11-13T22:00:00Z", "data": {
+                "sessionId": "sess-1", "context": {"cwd": "/work/demo"}}},
+            {"type": "user.message", "timestamp": "2026-11-13T22:00:01Z",
+             "data": {"content": "go"}},
+            {**start, "data": {**start["data"], "toolCallId": "c1"}},
+            complete("c1", {"message": "MCP server 'demo': could not connect",
+                            "code": "failure"}),
+            {**start, "data": {**start["data"], "toolCallId": "c2"}},
+            complete("c2", "plain error text"),
+            {**start, "data": {**start["data"], "toolCallId": "c3"}},
+            {"type": "tool.execution_complete", "data": {"toolCallId": "c3", "success": True}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second, ok = self._copilot_cli_store(tmp, events)[0].session.requests[0].tool_calls
+        self.assertEqual((first.error_code, first.error_message),
+                         ("failure", "MCP server 'demo': could not connect"))
+        self.assertEqual((first.failure_category, first.failure_stage),
+                         ("server_error", "invoke"))
+        self.assertEqual((first.context_tokens, first.context_limit), (52102, 272000))
+        self.assertTrue(first.is_error)
+        self.assertEqual((second.error_code, second.error_message), ("", "plain error text"))
+        self.assertEqual(second.failure_category, "server_error")
+        self.assertEqual((ok.error_message, ok.failure_category), ("", ""))
+        self.assertEqual((ok.context_tokens, ok.context_limit), (None, None))
+
     def test_discover_honours_provider_roots(self):
         """A store outside the current home is reachable via `roots`."""
         events = [
@@ -426,6 +465,62 @@ class ProviderTests(unittest.TestCase):
             session = relocated[0].session
             self.assertEqual((session.provider, session.workspace), ("copilot-cli", "demo"))
             self.assertEqual(session.requests[0].assistant_text, "hi")
+
+    def test_copilot_desktop_split_from_cli(self):
+        """Folders registered in data.db are reported as copilot-desktop, not copilot-cli."""
+        def log(session_id, text):
+            return [
+                {"type": "session.start", "timestamp": "2026-10-29T09:00:00Z", "data": {
+                    "sessionId": session_id, "copilotVersion": "1.0.80",
+                    "context": {"cwd": "/work/demo"}}},
+                {"type": "user.message", "timestamp": "2026-10-29T09:00:01Z",
+                 "data": {"content": text}},
+                {"type": "assistant.message", "data": {"model": "gpt-5.6-luna", "content": "ok"}},
+            ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for session_id, events in (
+                ("desk-1", log("desk-1", "from desktop")),
+                ("cli-1", log("cli-1", "from cli")),
+            ):
+                state = root / "session-state" / session_id
+                state.mkdir(parents=True)
+                (state / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+            # The desktop registry: desk-1 has a title, and a null title falls back.
+            db = sqlite3.connect(root / "data.db")
+            db.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
+            db.executemany("INSERT INTO sessions VALUES (?, ?)",
+                           [("desk-1", "Registry title"), ("ghost", "No folder")])
+            db.commit()
+            db.close()
+
+            cli = list(discover_copilot_cli(root))
+            self.assertEqual([(d.provider, d.session.session_id) for d in cli],
+                             [("copilot-cli", "cli-1")])
+
+            desktop = list(discover_copilot_desktop(root))
+            self.assertEqual(len(desktop), 1)
+            session = desktop[0].session
+            self.assertEqual((session.provider, session.title), ("copilot-desktop", "Registry title"))
+            self.assertEqual(session.requests[0].user_text, "from desktop")
+
+            both = discover({"copilot-cli", "copilot-desktop"}, roots={"copilot-cli": root,
+                                                                     "copilot-desktop": root})
+            self.assertEqual(sorted(d.provider for d in both), ["copilot-cli", "copilot-desktop"])
+
+    def test_copilot_desktop_without_registry(self):
+        """No data.db means no desktop sessions, and CLI keeps every folder."""
+        events = [
+            {"type": "session.start", "timestamp": "2026-10-29T09:00:00Z", "data": {
+                "sessionId": "sess-1", "copilotVersion": "1.0.80", "context": {"cwd": "/work/demo"}}},
+            {"type": "user.message", "data": {"content": "hello"}},
+            {"type": "assistant.message", "data": {"model": "gpt-5.6-luna", "content": "hi"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self._copilot_cli_store(tmp, events)
+            self.assertEqual(list(discover_copilot_desktop(Path(tmp))), [])
+            cli = list(discover_copilot_cli(Path(tmp)))
+            self.assertEqual([d.provider for d in cli], ["copilot-cli"])
 
     def test_agy_unknown_protobuf(self):
         with tempfile.TemporaryDirectory() as tmp:

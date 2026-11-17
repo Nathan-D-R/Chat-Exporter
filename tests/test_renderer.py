@@ -12,7 +12,7 @@ class RendererTests(unittest.TestCase):
             created_ms=1_775_178_266_000,
             model_id="test-model",
             provider="copilot-cli",
-            workspace="audit-tool",
+            workspace="demo-tool",
             requests=[
                 ChatRequest(
                     request_id="r1",
@@ -25,7 +25,7 @@ class RendererTests(unittest.TestCase):
                         ResponsePart(
                             "tool_call",
                             tool=ToolCall(
-                                name="redshift_query",
+                                name="db_query",
                                 output="sensitive raw transaction output",
                             ),
                         ),
@@ -38,7 +38,7 @@ class RendererTests(unittest.TestCase):
 
         self.assertIn("Review the suspicious transactions.", content)
         self.assertIn("two high-value cases", content)
-        self.assertNotIn("redshift_query", content)
+        self.assertNotIn("db_query", content)
         self.assertNotIn("sensitive raw transaction output", content)
         self.assertNotIn("Tool calls:", content)
         self.assertNotIn("Files changed:", content)

@@ -33,7 +33,7 @@ def _session(
         model_id="test-model",
         requests=[request],
         provider="copilot-cli",
-        workspace="audit-tool",
+        workspace="demo-tool",
     )
 
 
@@ -45,7 +45,7 @@ class SearchTests(unittest.TestCase):
             "Find the store hours mismatch",
             "The source comparison found a reconciliation issue.",
         )
-        items = [DiscoveredSession("copilot-cli", "audit-tool", session_path, session)]
+        items = [DiscoveredSession("copilot-cli", "demo-tool", session_path, session)]
         result = search_discovered(items, "store reconciliation")
         self.assertEqual(result["matching_sessions"], 1)
         hit = result["results"][0]
@@ -54,9 +54,9 @@ class SearchTests(unittest.TestCase):
 
     def test_search_filters_workspace_and_includes_tool_output(self):
         session = _session("session-1", "Investigation", "review it", "No useful text")
-        item = DiscoveredSession("copilot-cli", "audit-tool", session_path, session)
+        item = DiscoveredSession("copilot-cli", "demo-tool", session_path, session)
         self.assertEqual(
-            search_discovered([item], "42", workspace="audit", include_tool_output=True)[
+            search_discovered([item], "42", workspace="demo", include_tool_output=True)[
                 "matching_sessions"
             ],
             1,
@@ -73,13 +73,13 @@ class SearchTests(unittest.TestCase):
         items = [
             DiscoveredSession(
                 "copilot-cli",
-                "audit-tool",
+                "demo-tool",
                 session_path,
                 _session("old", "Older", "old", "old", created_ms=older),
             ),
             DiscoveredSession(
                 "copilot-cli",
-                "audit-tool",
+                "demo-tool",
                 session_path,
                 _session("new", "Newer", "new", "new", created_ms=newer),
             ),
@@ -98,19 +98,19 @@ class SearchTests(unittest.TestCase):
         items = [
             DiscoveredSession(
                 "copilot-cli",
-                "audit-tool",
+                "demo-tool",
                 session_path,
                 _session("old", "Old", "reconcile", "reconcile", created_ms=old),
             ),
             DiscoveredSession(
                 "copilot-cli",
-                "audit-tool",
+                "demo-tool",
                 session_path,
                 _session("recent", "Recent", "reconcile", "reconcile", created_ms=recent),
             ),
             DiscoveredSession(
                 "copilot-cli",
-                "audit-tool",
+                "demo-tool",
                 session_path,
                 _session("newest", "Newest", "reconcile", "reconcile", created_ms=newest),
             ),
