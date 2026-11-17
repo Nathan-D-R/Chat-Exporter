@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .parser import ChatRequest, ChatSession, ResponsePart, ToolCall
+from .prompts import display_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +620,7 @@ def _summary_blocks(
             lead = ["**Background task**", "", _notification_line(group[0]), ""]
             segments = [seg for seg in segments if not (seg[0] == "line" and seg[1] == _notification_line(group[0]))]
         else:
-            lead = ["**User**", "", group[0].user_text.strip(), ""]
+            lead = ["**User**", "", display_prompt(group[0].user_text), ""]
         lines = ["---", "", f"### Turn {number}", ""] + lead
         body: list[str] = []
         previous = ""

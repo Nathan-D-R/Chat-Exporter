@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .discovery import find_workspace_storage_dirs, get_workspace_name, list_chat_session_files
+from .prompts import TITLE_LIMIT, short_title, slash_command
 from .parser import ChatRequest, ChatSession, ResponsePart, SubagentCall, ToolCall, parse_session
 
 PROVIDERS = ("copilot", "copilot-cli", "copilot-desktop", "agy", "claude", "codex", "opencode")
@@ -88,10 +89,17 @@ def _duration(value: Any) -> int | None:
 
 
 def _title(requests: list[ChatRequest], fallback: str) -> str:
+    """First real human prompt; else the first slash command; else the fallback."""
     for request in requests:
-        if request.user_text.strip():
-            line = request.user_text.strip().splitlines()[0].lstrip("#").strip()
-            return line[:60] + ("..." if len(line) > 60 else "")
+        if request.is_notification:
+            continue
+        title = short_title(request.user_text)
+        if title:
+            return title
+    for request in requests:
+        command = slash_command(request.user_text)
+        if command:
+            return command[:TITLE_LIMIT]
     return fallback
 
 
