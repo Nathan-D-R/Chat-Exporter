@@ -6,6 +6,7 @@ import json
 import operator
 import os
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,18 @@ class DiscoveredSession:
     path: Path
     session: ChatSession | None
     error: str = ""
+
+
+def _jsonl_records(path: Path) -> Iterable[dict[str, Any]]:
+    """Read one JSON object at a time without retaining the raw transcript."""
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                yield record
 
 
 def _ms(value: Any) -> int:
@@ -124,23 +137,18 @@ def _claude_agent_result(agent_files: dict[str, Path], agent_id: str) -> str:
         return ""
     result = ""
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for item in _jsonl_records(path):
+            if item.get("type") != "assistant":
+                continue
+            text = "\n\n".join(
+                _dict(part).get("text", "")
+                for part in _dict(item.get("message")).get("content") or []
+                if _dict(part).get("type") == "text"
+            ).strip()
+            if text:
+                result = text
     except OSError:
         return ""
-    for line in lines:
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if item.get("type") != "assistant":
-            continue
-        text = "\n\n".join(
-            _dict(part).get("text", "")
-            for part in _dict(item.get("message")).get("content") or []
-            if _dict(part).get("type") == "text"
-        ).strip()
-        if text:
-            result = text
     return result
 
 
@@ -260,15 +268,7 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
     Those files live under the project directory of the subagent's own cwd, not
     next to the transcript that launched it, so the caller builds the map.
     """
-    records = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if (item.get("type") in ("user", "assistant") and not item.get("isSidechain")
-                and not item.get("isMeta")):
-            records.append(item)
+    first: dict[str, Any] | None = None
     if agent_files is None:
         agent_files = _claude_agent_files(path.parent)
 
@@ -278,7 +278,12 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
     # message id -> last output_tokens seen, so repeated records are not double counted
     usage_seen: dict[str, int] = {}
     model = ""
-    for item in records:
+    for item in _jsonl_records(path):
+        if (item.get("type") not in ("user", "assistant") or item.get("isSidechain")
+                or item.get("isMeta")):
+            continue
+        if first is None:
+            first = {key: item.get(key) for key in ("cwd", "gitBranch", "version")}
         message = _dict(item.get("message"))
         role = message.get("role") or item.get("type")
         content = message.get("content", "")
@@ -311,7 +316,7 @@ def parse_claude(path: Path, agent_files: dict[str, Path] | None = None) -> Chat
                 current.total_elapsed_ms = max(end_ms - current.timestamp_ms, 0)
     if not requests:
         return None
-    first = records[0]
+    assert first is not None
     workspace = Path(first.get("cwd") or path.parent.name).name
     session = ChatSession(path.stem, _title(requests, path.stem), requests[0].timestamp_ms,
                           model, requests, "claude", workspace, str(path))
@@ -407,11 +412,7 @@ def parse_codex(path: Path) -> ChatSession | None:
     model = ""
     tool_calls: dict[str, ResponsePart] = {}
     last_tool: ToolCall | None = None
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for row in _jsonl_records(path):
         payload = _dict(row.get("payload"))
         row_type = row.get("type")
         if row_type == "session_meta":
@@ -559,7 +560,7 @@ def _protobuf_strings(data: bytes, prefix: str = "", depth: int = 0) -> list[tup
 def parse_agy(path: Path, summary: dict[str, Any]) -> ChatSession | None:
     requests: list[ChatRequest] = []
     current: ChatRequest | None = None
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
         rows = db.execute("SELECT idx, step_type, step_payload FROM steps ORDER BY idx")
         for idx, step_type, payload in rows:
             strings = dict(_protobuf_strings(payload or b""))
@@ -597,7 +598,7 @@ def discover_agy(root: Path | None = None) -> Iterable[DiscoveredSession]:
     conversations = root / "conversations"
     if not summaries.is_file() or not conversations.is_dir():
         return
-    with sqlite3.connect(f"file:{summaries}?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(f"file:{summaries}?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         summary_by_id = {r["conversation_id"]: dict(r) for r in db.execute("SELECT * FROM conversation_summaries")}
     for path in sorted(conversations.glob("*.db")):
@@ -721,7 +722,7 @@ def discover_opencode(root: Path | None = None) -> Iterable[DiscoveredSession]:
             yield DiscoveredSession("opencode", path.parent.name, path, None, str(exc))
     for path in sorted(root.glob("opencode*.db")):
         try:
-            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
                 db.row_factory = sqlite3.Row
                 tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not {"session", "message", "part"}.issubset(tables):
@@ -781,7 +782,7 @@ def _copilot_cli_usage(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
         return {}
     usage: dict[tuple[str, int], dict[str, Any]] = {}
     try:
-        with sqlite3.connect(f"file:{store}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"file:{store}?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             rows = db.execute(
                 "SELECT session_id, turn_index, model, input_tokens, output_tokens,"
@@ -850,14 +851,7 @@ def parse_copilot_cli(path: Path, usage: dict[tuple[str, int], dict[str, Any]]) 
     resolved = ""
     turn_index = -1
 
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for event in _jsonl_records(path):
         kind = event.get("type")
         data = _dict(event.get("data"))
         stamp = _ms(event.get("timestamp"))
@@ -969,12 +963,12 @@ def discover_copilot_cli(root: Path | None = None) -> Iterable[DiscoveredSession
             yield DiscoveredSession("copilot-cli", directory.name, path, None, str(exc))
 
 
-def discover(
+def iter_discover(
     providers: set[str],
     config_root: Path | None = None,
     roots: dict[str, Path] | None = None,
-) -> list[DiscoveredSession]:
-    """Discover sessions for the named providers.
+) -> Iterable[DiscoveredSession]:
+    """Lazily discover sessions for the named providers.
 
     `roots` overrides where a provider's store is read from, which is what
     makes a store outside the current home reachable: one copied out of a
@@ -988,9 +982,15 @@ def discover(
     }
     # --config-root predates --root and stays an alias for the extension's store.
     default = {"copilot": config_root} if config_root else {}
-    return [
-        item
-        for name in PROVIDERS
-        if name in providers
-        for item in adapters[name](roots.get(name, default.get(name)))
-    ]
+    for name in PROVIDERS:
+        if name in providers:
+            yield from adapters[name](roots.get(name, default.get(name)))
+
+
+def discover(
+    providers: set[str],
+    config_root: Path | None = None,
+    roots: dict[str, Path] | None = None,
+) -> list[DiscoveredSession]:
+    """Collect sessions for callers that need a reusable list, such as exports."""
+    return list(iter_discover(providers, config_root, roots))

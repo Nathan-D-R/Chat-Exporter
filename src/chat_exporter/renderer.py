@@ -18,6 +18,7 @@ from .parser import ChatRequest, ChatSession, ResponsePart, ToolCall
 # ---------------------------------------------------------------------------
 
 DEFAULT_MAX_TOOL_OUTPUT = 2000
+DEFAULT_MAX_ASSISTANT_CHARS = 2000
 
 # Tools whose output is a wall of file content rather than a result worth
 # reading back; their invocation line already says which file was read.
@@ -34,6 +35,7 @@ _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
 _MD_ESCAPE_RE = re.compile(r"\\([_*`\[\]#])")
+_DETAILS_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
 
 # Stop reasons that mean the turn ended the way it was meant to; anything else
 # is worth showing next to the turn. Spellings vary by provider.
@@ -76,6 +78,28 @@ def _truncate(text: str, limit: int) -> str:
         return text
     kept = text[:limit].rstrip()
     return f"{kept}\n... [{len(text) - len(kept):,} more characters truncated]"
+
+
+def _condense_assistant_text(text: str, limit: int) -> str:
+    """Keep readable assistant prose while dropping embedded detail blocks."""
+    text = _DETAILS_RE.sub("", text)
+    lines: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence and line.strip():
+            lines.append(line.strip())
+    compact = _MULTI_SPACE_RE.sub(" ", " ".join(lines)).strip()
+    if limit <= 0 or len(compact) <= limit:
+        return compact
+    marker = " [assistant response condensed] "
+    if limit <= len(marker):
+        return marker[:limit]
+    head = max(1, (limit - len(marker)) // 2)
+    tail = limit - len(marker) - head
+    return compact[:head].rstrip() + marker + compact[-tail:].lstrip()
 
 
 def _collapse_blank_lines(text: str) -> str:
@@ -411,6 +435,30 @@ def _render_request(
     return "\n".join(lines)
 
 
+def _render_condensed_request(
+    req: ChatRequest,
+    index: int,
+    max_assistant_chars: int,
+) -> str:
+    lines: list[str] = ["---", "", f"### Turn {index}", "", "**User**", ""]
+    lines.append(req.user_text.strip())
+    lines.append("")
+
+    assistant = _condense_assistant_text(req.assistant_text, max_assistant_chars)
+    if assistant:
+        lines += ["**Assistant**", "", assistant, ""]
+
+    if req.error_code or req.is_incomplete:
+        detail = _MULTI_SPACE_RE.sub(
+            " ", (req.error_message or req.error_code or "response incomplete").replace("\n", " ")
+        ).strip()
+        label = "Interrupted" if req.error_code == "canceled" else "Error"
+        lines.append(f"> **{label}:** {detail}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Session header
 # ---------------------------------------------------------------------------
@@ -468,6 +516,16 @@ def _render_header(session: ChatSession, include_metrics: bool) -> list[str]:
     return lines
 
 
+def _render_condensed_header(session: ChatSession) -> list[str]:
+    return [
+        f"# {session.title}",
+        "",
+        f"**Session:** `{session.session_id}` · **Provider:** `{session.provider}` · "
+        f"**Workspace:** `{session.workspace}`",
+        "",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Public render functions
 # ---------------------------------------------------------------------------
@@ -481,9 +539,19 @@ def render_session(
     include_context: bool = False,
     include_tool_args: bool = False,
     max_tool_output: int = DEFAULT_MAX_TOOL_OUTPUT,
+    condensed: bool = False,
+    max_assistant_chars: int = DEFAULT_MAX_ASSISTANT_CHARS,
 ) -> str:
-    """Render a ChatSession as a Markdown document string."""
-    lines = _render_header(session, include_metrics)
+    """Render a ChatSession as Markdown.
+
+    Condensed mode keeps only user prompts and assistant prose, removes tool
+    calls, metrics, context, and file summaries, and bounds each assistant
+    response.
+    """
+    if condensed:
+        lines = _render_condensed_header(session)
+    else:
+        lines = _render_header(session, include_metrics)
 
     user_reqs = session.user_requests
     if not user_reqs:
@@ -491,21 +559,30 @@ def render_session(
         return "\n".join(lines)
 
     for idx, req in enumerate(user_reqs, start=1):
-        lines.append(
-            _render_request(
-                req,
-                idx,
-                include_tools=include_tools,
-                include_thinking=include_thinking,
-                include_metrics=include_metrics,
-                include_files=include_files,
-                include_context=include_context,
-                max_output=max_tool_output,
-                include_args=include_tool_args,
+        if condensed:
+            lines.append(
+                _render_condensed_request(
+                    req,
+                    idx,
+                    max_assistant_chars=max(0, max_assistant_chars),
+                )
             )
-        )
+        else:
+            lines.append(
+                _render_request(
+                    req,
+                    idx,
+                    include_tools=include_tools,
+                    include_thinking=include_thinking,
+                    include_metrics=include_metrics,
+                    include_files=include_files,
+                    include_context=include_context,
+                    max_output=max_tool_output,
+                    include_args=include_tool_args,
+                )
+            )
 
-    if include_files:
+    if include_files and not condensed:
         edited = session.edited_files
         if edited:
             lines.append("---")

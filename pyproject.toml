@@ -4,10 +4,11 @@ version = "0.2.0"
 description = "Export local AI coding chat sessions to structured Markdown files"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["mcp[cli]>=1.29.0,<2.0.0"]
 
 [project.scripts]
 chat-exporter = "chat_exporter.main:main"
+chat-exporter-mcp = "chat_exporter.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -15,3 +16,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chat_exporter"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]

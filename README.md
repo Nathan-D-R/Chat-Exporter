@@ -157,6 +157,31 @@ per-call error flags, and raw timing values.
 The exporter opens source stores read-only. It writes only beneath the selected
 output directory.
 
+## Search local chat history through MCP
+
+The `chat-exporter-mcp` command exposes `search_chat_history` and
+`read_chat_session` over stdio. It searches current local provider stores
+directly, without creating an export. Register the command with an MCP client
+that can launch stdio servers. From this checkout, run:
+
+```bash
+uv run chat-exporter-mcp
+```
+
+`search_chat_history` returns ranked snippets and session IDs. Pass a result to
+`read_chat_session` for a bounded transcript. Set `condensed=true` to keep user
+prompts and assistant prose while omitting tool calls and metrics. Searches are
+read-only. They cover all supported providers by default and can be narrowed by
+provider, workspace substring, or `recent_days`. An empty query browses recent
+sessions; `sort_by="recent"` orders matches by time.
+
+MCP discovery parses sessions incrementally and keeps only the requested number
+of search hits. Codex, Claude, and Copilot CLI JSONL logs are read one record at
+a time. Reading a session stops discovery as soon as a match is found. Memory
+still depends on the largest parsed session (including its tool output), and
+workspace/date filters apply after parsing each session. Provider filters avoid
+opening unselected stores. The export CLI retains its list-based discovery.
+
 ## Copilot editor support
 
 Copilot workspace discovery supports VS Code, VS Code Insiders, Cursor, and
